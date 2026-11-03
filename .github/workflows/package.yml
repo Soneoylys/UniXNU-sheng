@@ -140,6 +140,18 @@ jobs:
                   path.write_text(fixed)
                   print(f'{path.name}: added the new file mode of {count} file creation(s)')
           PY
+      - name: boot image v0 self-check
+        run: |
+          # UniXNU 26c2ed6 reads a header v0 kernel from offset 0; it starts one page in, after the header.
+          python3 - <<'PY'
+          import pathlib
+          path = pathlib.Path('UniXNU/scripts/unixnu/bootimg.py')
+          text = path.read_text()
+          old = '        start = 0\n        ramdisk_start = page * (1 + -(-kernel_size // page))\n'
+          if old in text:
+              path.write_text(text.replace(old, old.replace('start = 0', 'start = page', 1)))
+              print('bootimg.py: header v0 kernel read from one page in')
+          PY
       - name: package
         working-directory: device
         env:
