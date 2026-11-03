@@ -75,8 +75,14 @@ jobs:
         env:
           seed: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
         run: |
-          if ! [[ "$seed" =~ ^[0-9a-fA-F]{8}$ ]]; then
-            echo 'Set the repository secret UNIXNU_UNIQUE_CHIP_ID: the platform seed of the device, 8 hex digits.' >&2
+          # The resolver parses the seed with int(seed, 16), which ignores surrounding whitespace.
+          trimmed="$(printf '%s' "$seed" | tr -d '[:space:]')"
+          if [ -z "$trimmed" ]; then
+            echo 'The repository secret UNIXNU_UNIQUE_CHIP_ID is empty or not visible to this run. Add it under Settings > Secrets and variables > Actions > Repository secrets.' >&2
+            exit 1
+          fi
+          if ! [[ "$trimmed" =~ ^(0x|0X)?[0-9a-fA-F]{1,16}$ ]]; then
+            echo "UNIXNU_UNIQUE_CHIP_ID has ${#trimmed} characters after removing whitespace and is not a platform seed. Store only the value: up to 16 hex digits (64-bit), optionally with 0x, without quotes or a name." >&2
             exit 1
           fi
       - name: seed cache identity
