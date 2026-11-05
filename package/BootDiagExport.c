@@ -14,6 +14,59 @@
 #include <IOKit/IOLib.h>
 #include <pexpert/pexpert.h>
 
+extern void native_wifi_logf(int, const char *, ...) __attribute__((weak_import));
+/* Opt-in capture of the cache loader's own error log. Runs on the log writer,
+ * reads one fixed file and stops after two minutes; ordinary boots do no I/O. */
+void boot_cache_loader_log_capture(unsigned now) {
+  static int enabled = -1, last_error = -1;
+  static unsigned next_read;
+  static uint64_t last_size = UINT64_MAX;
+  static struct timespec last_modified;
+  static char *buffer;
+  enum {capacity = 8192};
+  if (enabled < 0) {
+    uint32_t value = 0;
+    enabled = PE_parse_boot_argn("sheng-cache-log", &value, sizeof value) && value == 1;
+  }
+  if (!enabled || !&native_wifi_logf) return;
+  if (now > 120) { if (buffer) {IOFreeData(buffer, capacity); buffer = NULL;} return; }
+  if (now < 10 || now < next_read) return;
+  next_read = now + 4;
+  vfs_context_t ctx = vfs_context_kernel();
+  vnode_t vp = NULLVP;
+  const char *path = "/private/var/log/com.apple.xpc.launchd/launchd_cache_loader.log";
+  int error = vnode_open(path, FREAD, 0, 0, &vp, ctx);
+  struct vnode_attr va;
+  VATTR_INIT(&va); VATTR_WANTED(&va, va_data_size); VATTR_WANTED(&va, va_modify_time);
+  if (!error) error = vnode_getattr(vp, &va, ctx);
+  if (!error && (va.va_data_size != last_size ||
+      va.va_modify_time.tv_sec != last_modified.tv_sec || va.va_modify_time.tv_nsec != last_modified.tv_nsec)) {
+    if (!buffer) buffer = IOMallocData(capacity);
+    if (!buffer) error = ENOMEM;
+    else {
+      uint64_t offset = va.va_data_size > capacity ? va.va_data_size - capacity : 0;
+      int length = (int)(va.va_data_size - offset), resid = length;
+      error = vn_rdwr(UIO_READ, vp, buffer, length, (off_t)offset, UIO_SYSSPACE,
+          IO_NOAUTH, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+      if (!error && resid >= 0 && resid <= length) {
+        length -= resid; last_size = va.va_data_size; last_modified = va.va_modify_time;
+        native_wifi_logf(6, "cache-loader-file: size %llu offset %llu bytes %d mtime %llu.%09u", last_size, offset, length,
+            (unsigned long long)last_modified.tv_sec, (unsigned)last_modified.tv_nsec);
+        for (int at = 0; at < length;) {
+          int n = 0;
+          while (at + n < length && n < 76 && buffer[at + n] != '\n') ++n;
+          if (n) native_wifi_logf(6, "cache-loader-file %u: %.*s", (unsigned)(offset + at), n, buffer + at);
+          at += n;
+          if (at < length && buffer[at] == '\n') ++at;
+        }
+      } else if (!error) error = EIO;
+    }
+  }
+  if (vp) vnode_close(vp, FREAD, ctx);
+  if (error != last_error) {last_error = error; native_wifi_logf(6, "cache-loader-file: read status %d", error);}
+}
+
+
 enum {DiagMaxFiles = 128, DiagPath = 192, DiagDepth = 0, DiagChunk = 256 * 1024, DiagNote = 32768};
 struct diag_file {char path[DiagPath]; uint64_t size; uint32_t mode, uid, gid, root, keep;};
 static struct diag_file *diag_files;
@@ -140,10 +193,30 @@ extern void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
 extern volatile uint64_t *native_touch_report_ring __attribute__((weak_import));
 extern volatile uint32_t native_touch_report_count __attribute__((weak_import));
 enum {TouchRing = 65536};
-// The client sampler (BootUiTraceProbe.c): kernel.client.bin is its ring in time order (16-byte header "CLI1", u32 total, u32 kept, u32 0;
+// Display refresh ticks (LegacyDisplayProbe.cpp), kernel.vsync.bin: header "VSY1", total, kept, 0; then u64 (microseconds << 3) | event
+// (0 armed, 1 sent, 2 idle stop, 3 late, 4 started, 5 refresh reported), oldest first.
+#include "TouchTrace.h"
+_Static_assert(sizeof(struct touch_trace_row) == 48, "TPR1 row");
+extern const struct touch_trace_row *sheng_touch_trace_freeze(uint32_t *) __attribute__((weak_import));
+extern unsigned native_legacy_prepare_report(char *,unsigned) __attribute__((weak_import));
+static const struct touch_trace_row *path_trace;
+static uint32_t path_total, path_kept;
+extern uint64_t *native_legacy_vsync_ring __attribute__((weak_import));
+extern volatile uint32_t native_legacy_vsync_count __attribute__((weak_import));
+enum {VsyncRing = 65536};
+// CPU frequency governor windows (CpuFreqProbe.cpp), kernel.cpufreq.bin: header "CPF1", total, kept, 0; then 32-byte records
+// {u64 microseconds, u16 voted MHz[3], u16 running MHz[3], u16 busiest CPU per mille[3], u16 flags (1 touch boost, 2 frame floor), u32 0},
+// domains 0 the A510s, 1 the A715/A710s, 2 the X3.
+struct cpufreq_rec {uint64_t abs; uint16_t vote_mhz[3], state_mhz[3], busy_pm[3]; uint16_t flags; uint32_t reserved;};
+_Static_assert(sizeof(struct cpufreq_rec) == 32, "cpufreq record");
+extern struct cpufreq_rec *native_cpufreq_ring __attribute__((weak_import));
+extern volatile uint32_t native_cpufreq_count __attribute__((weak_import));
+enum {CpuFreqRing = 32768};
+// The client sampler (BootUiTraceProbe.c): kernel.client.bin is its ring in time order (16-byte header "CLI1", u32 total, u32 kept, u32 flags;
 // then 128-byte records {u64 microseconds, i32 pid, u16 state, i16 priority, u32 context switches, i32 mach_msg peer pid, u64 CPU time
 // (mach units), u64 wait event, u64 frames[11] (pc, lr, nine callers)}); kernel.rings.txt has a C row per target (pid, shared cache
 // slide, main image address, name). A record lasts until the next one of the same pid (unchanged blocked threads are not repeated).
+// Flag 1: records with peer -2 carry the interrupted CPU number in the wait slot and the time observed on that CPU.
 struct cs_rec {uint64_t abs; int32_t pid; uint16_t state; int16_t pri; uint32_t cs; int32_t peer; uint64_t cpu, wait, frames[11];};
 struct cs_target {int pid; unsigned slide; uint64_t image, seen; char name[32];};
 // CPU occupancy (BootUiTraceProbe.c), kernel.cpus.bin: header "CPU1", total, kept, 0; then 40-byte records {u64 microseconds, i16 priority
@@ -193,6 +266,7 @@ extern volatile unsigned boot_client_target_count __attribute__((weak_import));
 enum {ClientRing = 262144};   // BootUiTraceProbe.c CS_RING
 static uint32_t client_kept, client_keep;
 static uint32_t touch_kept,touch_keep;
+static uint32_t vsync_kept,vsync_keep,cpufreq_kept,cpufreq_keep;
 
 static void latency_tick(void) {
   if (!&native_legacy_swapstat || native_legacy_swapstat[9] < 50) return;   // the home screen draws
@@ -202,6 +276,14 @@ static void latency_tick(void) {
   if (&native_adreno_bo_hook && !boalloc_ring) {
     boalloc_ring = IOMallocAligned(sizeof(struct boalloc_rec) * BoAllocRing, PAGE_SIZE);
     if (boalloc_ring) {memset(boalloc_ring, 0, sizeof(struct boalloc_rec) * BoAllocRing); native_adreno_bo_hook = boalloc_hook;}
+  }
+  if (&native_legacy_vsync_ring && !native_legacy_vsync_ring) {
+    uint64_t *ticks = IOMallocAligned(sizeof(uint64_t) * VsyncRing, PAGE_SIZE);
+    if (ticks) {memset(ticks, 0, sizeof(uint64_t) * VsyncRing); native_legacy_vsync_ring = ticks;}
+  }
+  if (&native_cpufreq_ring && !native_cpufreq_ring) {
+    struct cpufreq_rec *windows = IOMallocAligned(sizeof(struct cpufreq_rec) * CpuFreqRing, PAGE_SIZE);
+    if (windows) {memset(windows, 0, sizeof(struct cpufreq_rec) * CpuFreqRing); native_cpufreq_ring = windows;}
   }
   if (&native_touch_report_ring && !native_touch_report_ring) {
     uint64_t *touches = IOMallocAligned(sizeof(uint64_t) * TouchRing, PAGE_SIZE);
@@ -258,6 +340,13 @@ static void rings_build(void) {
   const size_t alen = args ? strlen(args) : 0;
   RT("# boot-args seen by the kernel: length %lu first32 [%.32s] last32 [%s]\n", (unsigned long)alen, args ? args : "", alen > 32 ? args + alen - 32 : (args ? args : ""));
   RT("# autoreset: %s\n", boot_log_autoreset_text);
+  if (&native_legacy_prepare_report) {
+    char status[256];
+    native_legacy_prepare_report(status, sizeof status);
+    RT("# display: %s; vsync ring allocated=%u recorded=%u\n", status,
+       (unsigned)(&native_legacy_vsync_ring && native_legacy_vsync_ring != NULL),
+       &native_legacy_vsync_count ? native_legacy_vsync_count : 0);
+  }
   if (&native_legacy_ring_count && &native_legacy_ring_cap && native_legacy_ring_cap) {
     const uint32_t n = native_legacy_ring_count;
     RT("# swap ring: S <us> <event 1 validated 2 fence wait 3 fence passed 4 flip 5 latch 6 retire 7 copy offer 8 blank> <slot or -1> <validated depth> <fences out> <tag> (total %u)\n", n);
@@ -357,6 +446,14 @@ uint64_t boot_diag_scan(uint64_t budget) {
     const uint64_t cost = 24 + strlen("screen-000-0.bgrx") + 16 + (uint64_t)shot_w * shot_h * 4;
     if (used + cost <= budget) {++shots_kept; used += cost;} else shot_time[i] = 0xffffffffu;
   }
+  path_total = 0;
+  path_trace = sheng_touch_trace_freeze ? sheng_touch_trace_freeze(&path_total) : NULL;
+  path_kept = path_total > TouchTraceCapacity ? TouchTraceCapacity : path_total;
+  if (path_trace) {
+    const uint64_t cost = 24 + strlen("kernel.touchpath.bin") + 16 + (uint64_t)path_kept * sizeof(*path_trace);
+    if (used + cost <= budget) used += cost;
+    else {note("touch-budget", "kernel.touchpath.bin", (int)path_kept); path_trace = NULL;}
+  }
   rings_keep=0;
   // Files are scanned before optional exports. Frame records have first claim
   // on the budget, so fast IPC and scene data cannot displace the causal trace.
@@ -409,6 +506,19 @@ uint64_t boot_diag_scan(uint64_t budget) {
     const uint64_t cost = 24 + strlen("kernel.boalloc.bin") + 16 + (uint64_t)kept * sizeof(struct boalloc_rec);
     if (used + cost <= budget) {boalloc_keep = 1; used += cost;}
   }
+  vsync_keep = cpufreq_keep = 0;
+  vsync_kept = (&native_legacy_vsync_count && &native_legacy_vsync_ring && native_legacy_vsync_ring) ? native_legacy_vsync_count : 0;
+  if (&native_legacy_vsync_ring && native_legacy_vsync_ring) {
+    const uint32_t kept = vsync_kept > VsyncRing ? VsyncRing : vsync_kept;
+    const uint64_t cost = 24 + strlen("kernel.vsync.bin") + 16 + (uint64_t)kept * 8;
+    if (used + cost <= budget) {vsync_keep = 1; used += cost;}
+  }
+  cpufreq_kept = (&native_cpufreq_count && &native_cpufreq_ring && native_cpufreq_ring) ? native_cpufreq_count : 0;
+  if (cpufreq_kept) {
+    const uint32_t kept = cpufreq_kept > CpuFreqRing ? CpuFreqRing : cpufreq_kept;
+    const uint64_t cost = 24 + strlen("kernel.cpufreq.bin") + 16 + (uint64_t)kept * sizeof(struct cpufreq_rec);
+    if (used + cost <= budget) {cpufreq_keep = 1; used += cost;}
+  }
   touch_kept = (&native_touch_report_count && &native_touch_report_ring && native_touch_report_ring) ? native_touch_report_count : 0;
   if (touch_kept) {
     const uint32_t kept = touch_kept > TouchRing ? TouchRing : touch_kept;
@@ -439,7 +549,7 @@ int boot_diag_stream(boot_diag_emit_t emit, void *arg) {
   if (!chunk) return -1;
   vfs_context_t ctx = vfs_context_kernel();
   int rc = emit("M2VCACH1", 8, arg);
-  const uint32_t root_len = 1, count = boot_diag_files + 1 + rings_keep + client_keep + touch_keep + cpu_keep + boalloc_keep + ptime_keep + !!gpu_trace_size[0] + !!latency_size + shots_kept;
+  const uint32_t root_len = 1, count = boot_diag_files + 1 + rings_keep + client_keep + touch_keep + !!path_trace + vsync_keep + cpufreq_keep + cpu_keep + boalloc_keep + ptime_keep + !!gpu_trace_size[0] + !!latency_size + shots_kept;
   if (!rc) rc = emit(&root_len, 4, arg);
   if (!rc) rc = emit("/", 1, arg);
   if (!rc) rc = emit(&count, 4, arg);
@@ -545,9 +655,59 @@ int boot_diag_stream(boot_diag_emit_t emit, void *arg) {
       at += n;
     }
   }
+  if (!rc && path_trace) {
+    const uint32_t head[4] = {'T' | 'P' << 8 | 'R' << 16 | (uint32_t)'1' << 24,
+                              path_total, path_kept, sizeof(*path_trace)};
+    rc = put_head(emit, arg, "kernel.touchpath.bin", 0100644, 0, 0, 16 + (uint64_t)path_kept * sizeof(*path_trace));
+    if (!rc) rc = emit(head, sizeof head, arg);
+    for (uint32_t at = 0; !rc && at < path_kept;) {
+      const uint32_t index = (path_total - path_kept + at) % TouchTraceCapacity;
+      uint32_t n = path_kept - at;
+      if (n > TouchTraceCapacity - index) n = TouchTraceCapacity - index;
+      if (n > DiagChunk / sizeof(*path_trace)) n = DiagChunk / sizeof(*path_trace);
+      rc = emit(path_trace + index, n * sizeof(*path_trace), arg);
+      at += n;
+    }
+  }
+  if (!rc && vsync_keep) {
+    const uint32_t total = vsync_kept, kept = total > VsyncRing ? VsyncRing : total;
+    const uint32_t head[4] = {'V' | 'S' << 8 | 'Y' << 16 | (uint32_t)'1' << 24, total, kept, 0};
+    rc = put_head(emit, arg, "kernel.vsync.bin", 0100644, 0, 0, 16 + (uint64_t)kept * 8);
+    if (!rc) rc = emit(head, sizeof head, arg);
+    for (uint32_t at = 0; !rc && at < kept;) {
+      const uint32_t n = kept - at < 8192 ? kept - at : 8192;
+      for (uint32_t k = 0; k < n; ++k) {
+        const uint64_t v = native_legacy_vsync_ring[(total - kept + at + k) & (VsyncRing - 1)];
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(v >> 3, &ns);
+        const uint64_t out = ((ns / 1000) << 3) | (v & 7);
+        memcpy(chunk + (size_t)k * 8, &out, 8);
+      }
+      rc = emit(chunk, n * 8, arg);
+      at += n;
+    }
+  }
+  if (!rc && cpufreq_keep) {
+    const uint32_t total = cpufreq_kept, kept = total > CpuFreqRing ? CpuFreqRing : total;
+    const uint32_t head[4] = {'C' | 'P' << 8 | 'F' << 16 | (uint32_t)'1' << 24, total, kept, 0};
+    rc = put_head(emit, arg, "kernel.cpufreq.bin", 0100644, 0, 0, 16 + (uint64_t)kept * sizeof(struct cpufreq_rec));
+    if (!rc) rc = emit(head, sizeof head, arg);
+    for (uint32_t at = 0; !rc && at < kept;) {
+      const uint32_t n = kept - at < 4096 ? kept - at : 4096;
+      for (uint32_t k = 0; k < n; ++k) {
+        struct cpufreq_rec r = native_cpufreq_ring[(total - kept + at + k) & (CpuFreqRing - 1)];
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(r.abs, &ns);
+        r.abs = ns / 1000;
+        memcpy(chunk + (size_t)k * sizeof r, &r, sizeof r);
+      }
+      rc = emit(chunk, n * sizeof(struct cpufreq_rec), arg);
+      at += n;
+    }
+  }
   if (!rc && client_keep) {
     const uint32_t client_total = client_kept, kept = client_total > ClientRing ? ClientRing : client_total;
-    const uint32_t head[4] = {'C' | 'L' << 8 | 'I' << 16 | (uint32_t)'1' << 24, client_total, kept, 0};
+    const uint32_t head[4] = {'C' | 'L' << 8 | 'I' << 16 | (uint32_t)'1' << 24, client_total, kept, 1};
     rc = put_head(emit, arg, "kernel.client.bin", 0100644, 0, 0, 16 + (uint64_t)kept * sizeof(struct cs_rec));
     if (!rc) rc = emit(head, sizeof head, arg);
     for (uint32_t at = 0; !rc && at < kept;) {   // oldest first, microseconds since boot

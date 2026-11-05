@@ -5,6 +5,7 @@
 #include <kern/thread.h>
 #include <kern/simple_lock.h>
 #include <kern/clock.h>
+#include <pexpert/pexpert.h>
 #include <kern/misc_protos.h>
 #include <machine/machine_routines.h>
 #include <arm/thread.h>
@@ -25,6 +26,7 @@
 #endif
 #include "BootUiTraceCore.h"
 #include "BootLatencyTrace.h"
+#include "BootSpringBoardProfile.h"
 extern void proc_name(int pid, char *buf, int size);   // bsd/sys/proc.h; the header itself clashes with the Mach types used here
 extern int proc_selfpid(void);
 #include "BootUiTraceDetails.h"
@@ -44,15 +46,17 @@ struct bt_prev {uint64_t tid,at,cpu;uint32_t cs;};
 struct bt_hotrow {unsigned rate,cpu;char role;int peer;uint64_t tid,pc,lr,frames[BT_HOT_FRAMES],kernel[BT_KFRAMES];unsigned state,hint;int pri;uint64_t event,trap,args[3];};
 static uint64_t sample_k[BT_MAX_THREADS][BT_KFRAMES],sample_event[BT_MAX_THREADS];
 static unsigned sample_state[BT_MAX_THREADS],sample_hint[BT_MAX_THREADS];static int sample_pri[BT_MAX_THREADS];
-// Where a blocked thread sits in the kernel: the link register and frame chain its context switch saved (the thread is not running while
-// it is blocked; for a running one the chain is merely stale, and every step stays inside its kernel stack).
+// All callers hold sched_lock. Switch-out can detach the stack before it takes
+// that lock and clears TH_RUN, even after the thread has set TH_WAIT.
 static void bt_kernel_stack(thread_t thread,uint64_t *out) {
  memset(out,0,BT_KFRAMES*sizeof(uint64_t));
- if(!thread->kernel_stack)return;
- const uint64_t low=(uint64_t)thread->kernel_stack,high=low+(uint64_t)kernel_stack_size;
+ if((thread->state & (TH_WAIT|TH_RUN|TH_TERMINATE|TH_TERMINATE2)) != TH_WAIT)return;
+ const uintptr_t low=thread->kernel_stack,size=kernel_stack_size;
+ if(!low)return;
  thread_kernel_state_t state=thread_get_kernel_state(thread);
+ if(!state || size<sizeof(*state) || (uintptr_t)state<low || (uintptr_t)state-low>size-sizeof(*state))return;
  uint64_t fp=state->machine.ss.fp;out[0]=state->machine.ss.lr;
- for(unsigned i=1;i<BT_KFRAMES && fp>=low && fp+16<=high && !(fp&15);++i) {
+ for(unsigned i=1;i<BT_KFRAMES && fp>=low && fp-low<=size-16 && !(fp&15);++i) {
   const uint64_t *frame=(const uint64_t *)fp;out[i]=frame[1];
   const uint64_t next=frame[0];if(next<=fp)break;fp=next;
  }
@@ -523,6 +527,52 @@ static void cs_refresh(void) {
  }
 }
 extern uint64_t native_gpu_role_thread(uint32_t,uint32_t) __attribute__((weak_import));
+// A running target's user registers at the sample instant: the user state saved in its PCB is the one of its last kernel entry, so a
+// thread busy in user code showed where it last entered the kernel (its system calls) instead of what it was running. A cross call to the
+// CPU it runs on interrupts it there; the handler copies the interrupted user PC, LR and FP when that CPU still runs it in user mode.
+// Such samples carry peer -2. One request at a time: the sampler is a single thread, and a request that did not answer within 1 ms stays
+// owned by its CPU until it does.
+struct cs_ipi {thread_t target;uint64_t pc,lr,fp,abs,tid;uint32_t cpu,pmu[2],pmu_status,switches;bool measure;volatile uint32_t done,user;};
+static struct cs_ipi cs_ipi_req;
+static volatile bool cs_ipi_busy;
+static unsigned cs_exact_enabled = 1, cs_profile;
+static uint64_t sb_probe_epoch, sb_probe_total, sb_probe_max;
+static unsigned sb_probe_attempts, sb_probe_exact;
+static void cs_ipi_handler(void *arg) {
+ struct cs_ipi *q=(struct cs_ipi *)arg;
+ arm_saved_state_t *s=(arm_saved_state_t *)getCpuDatap()->cpu_int_state;
+ if(s && current_thread()==q->target && is_saved_state64(s) && PSR64_IS_USER(get_saved_state_cpsr(s))) {
+  q->abs=mach_absolute_time();
+  q->cpu=cpu_number();
+  if(q->measure){
+   q->tid=current_thread()->thread_id;
+   q->switches=current_thread()->c_switch;
+   q->pmu_status=sb_pmu_read(q->cpu,q->pmu);
+  }
+  q->pc=(uint64_t)get_saved_state_pc(s);q->lr=(uint64_t)get_saved_state_lr(s);q->fp=(uint64_t)get_saved_state_fp(s);q->user=1;
+ }
+ __atomic_store_n(&q->done,1,__ATOMIC_RELEASE);
+}
+// 1: e holds the target's user PC, LR and FP at this instant.
+static int cs_exact(thread_t thread,int cpu,struct bt_entry *e,struct cs_rec *sample,bool measure) {
+ struct cs_ipi *q=&cs_ipi_req;
+ if(cs_ipi_busy) {if(!__atomic_load_n(&q->done,__ATOMIC_ACQUIRE))return 0;cs_ipi_busy=false;}
+ if(cpu<0 || cpu==cpu_number())return 0;
+ q->target=thread;q->measure=measure;q->user=0;q->pc=q->lr=q->fp=0;__atomic_store_n(&q->done,0,__ATOMIC_RELEASE);
+ if(cpu_xcall(cpu,cs_ipi_handler,q)!=KERN_SUCCESS)return 0;
+ cs_ipi_busy=true;
+ const uint64_t start=mach_absolute_time();uint64_t limit=0;nanoseconds_to_absolutetime(cs_profile ? 150000 : 1000000,&limit);
+ while(!__atomic_load_n(&q->done,__ATOMIC_ACQUIRE))if(mach_absolute_time()-start>limit)return 0;
+ cs_ipi_busy=false;
+ if(!q->user)return 0;
+ e->pc=BT_STRIP_USER_PC(q->pc);e->lr=BT_STRIP_USER_PC(q->lr);e->fp=q->fp;e->trap=0;
+ // A thread interrupted in user mode has no wait event. Store its CPU in that
+ // slot for exact samples only (CLI1 header flag 1).
+ sample->abs=q->abs;
+ sample->wait=q->cpu;
+ if(measure)boot_latency_pmu(sample->pid,q->tid,q->abs,q->cpu,q->switches,q->pmu_status,q->pmu);
+ return 1;
+}
 static void cs_sample(unsigned slot,unsigned role) {
  task_t task=cs_task[slot];
  if(!task || !task_lock_try(task))return;
@@ -532,7 +582,7 @@ static void cs_sample(unsigned slot,unsigned role) {
  ipc_space_t space=task->itk_space;if(space)is_reference(space);
  struct cs_rec r;memset(&r,0,sizeof(r));
  struct bt_entry e;memset(&e,0,sizeof(e));
- bool got=false;
+ bool got=false;int running_cpu=-1;
  thread_t thread=(thread_t)queue_first(&task->threads);
  const bool server=!strcmp(cs_names[slot],"backboardd");
  const uint64_t render=server && &native_gpu_role_thread?native_gpu_role_thread((uint32_t)cs_pid[slot],role):0;
@@ -543,10 +593,13 @@ static void cs_sample(unsigned slot,unsigned role) {
   if(role>1 && (queue_end(&task->threads,(queue_entry_t)thread) || thread->thread_id!=render)){task_unlock(task);vm_map_deallocate(map);if(space)is_release(space);return;}
  }
  if(!queue_end(&task->threads,(queue_entry_t)thread)) {
+  if(cs_profile && !server)boot_latency_sb_target(thread->thread_id);
   bool irq=ml_set_interrupts_enabled(false);
   if(simple_lock_try(&thread->sched_lock,&thread_lck_grp)) {
    r.state=(uint16_t)thread->state;if(render && thread->thread_id==render)r.state|=(uint16_t)(role<<12);if(thread_get_runq(thread)!=PROCESSOR_NULL)r.state|=0x8000;
    r.pri=(int16_t)thread->sched_pri;r.cs=thread->c_switch;r.wait=(uint64_t)thread->wait_event;r.cpu=recount_thread_time_mach(thread);
+   processor_t on=thread->last_processor;
+   if((thread->state&TH_RUN) && !(r.state&0x8000) && on && on->active_thread==thread)running_cpu=on->cpu_id;
    arm_saved_state_t *state=thread->machine.upcb;
    if(state && is_saved_state64(state)) {
     e.pc=BT_STRIP_USER_PC((uint64_t)get_saved_state_pc(state));e.lr=BT_STRIP_USER_PC((uint64_t)get_saved_state_lr(state));
@@ -560,10 +613,19 @@ static void cs_sample(unsigned slot,unsigned role) {
  }
  task_unlock(task);
  r.abs=mach_absolute_time();r.pid=cs_pid[slot];r.peer=-1;
+ const bool attempt=cs_exact_enabled && running_cpu>=0 && (!cs_profile || !server);
+ const uint64_t probe_start=cs_profile && attempt ? mach_absolute_time() : 0;
+ const bool exact=attempt && cs_exact(thread,running_cpu,&e,&r,cs_profile && &sheng_pmu_fixup && sheng_pmu_fixup);
+ if(probe_start){
+  uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-probe_start,&ns);
+  ++sb_probe_attempts;sb_probe_exact+=exact;sb_probe_total+=ns;
+  if(ns>sb_probe_max)sb_probe_max=ns;
+ }
+ if(exact){got=true;r.peer=-2;}
  if(got) {
   r.frames[0]=e.pc;r.frames[1]=e.lr;
   if(bt_user(e.pc,4) && (!e.lr || bt_user(e.lr,4)))bt_walk_n(&e,read_user,map,&r.frames[2],9);
-  if(e.trap==UINT64_MAX-46){lookup_peer(&e,space);r.peer=e.peer;}
+  if(!exact && e.trap==UINT64_MAX-46){lookup_peer(&e,space);r.peer=e.peer;}
  }
  if(space)is_release(space);
  vm_map_deallocate(map);
@@ -615,7 +677,7 @@ static void cs_hot_samples(void) {
      bool irq=ml_set_interrupts_enabled(false);
      if(best!=current_thread() && simple_lock_try(&best->sched_lock,&thread_lck_grp)) {
       r.state=(uint16_t)(best->state|0x6000);r.pri=(int16_t)best->sched_pri;r.cs=best->c_switch;
-      if(!(best->state&TH_RUN))bt_kernel_stack(best,k);else memset(k,0,sizeof(k));
+      bt_kernel_stack(best,k);
       for(unsigned i=0;i<10 && i<BT_KFRAMES;++i)r.frames[i]=k[i];
       r.frames[10]=(uint64_t)ptrauth_strip((void *)(uintptr_t)best->continuation,ptrauth_key_function_pointer);   // a kernel thread's work loop
       thread_unlock(best);got=true;
@@ -715,6 +777,11 @@ static void cs_thread(void *arg,wait_result_t result) {
  (void)arg;(void)result;
  for(unsigned tick=0;;++tick) {
   boot_latency_fault_drain();
+  if(cs_profile && tick%250==0){
+   uint64_t now=0;absolutetime_to_nanoseconds(mach_absolute_time(),&now);
+   if(sb_probe_epoch)boot_latency_record(41,sb_probe_epoch/1000,now/1000,sb_probe_attempts,sb_probe_exact,sb_probe_total,sb_probe_max);
+   sb_probe_epoch=now;sb_probe_attempts=sb_probe_exact=0;sb_probe_total=sb_probe_max=0;
+  }
   if(tick%25==0){cs_refresh();cs_ptime_pass();cs_hot_samples();cs_waiters();}   // every 100 ms: an app's launch shows within that
   cs_tick=tick;
   for(unsigned i=0;i<CS_TARGETS;++i)for(unsigned role=1;role<=(strcmp(cs_names[i],"backboardd")?1u:CS_ROLES);++role)cs_sample(i,role);
@@ -733,6 +800,9 @@ static void cs_thread(void *arg,wait_result_t result) {
 }
 void boot_client_sampler_start(void) {
  if(__atomic_exchange_n(&cs_started,1,__ATOMIC_ACQUIRE))return;
+ PE_parse_boot_argn("cs-profile",&cs_profile,sizeof(cs_profile));
+ if(cs_profile && &sheng_pmu_fixup)sheng_pmu_fixup=sb_pmu_fixup;
+ PE_parse_boot_argn("cs-exact",&cs_exact_enabled,sizeof(cs_exact_enabled));
  struct cs_rec *ring=(struct cs_rec *)IOMallocAligned(sizeof(struct cs_rec)*CS_RING,4096);
  if(!ring)return;
  memset(ring,0,sizeof(struct cs_rec)*CS_RING);
