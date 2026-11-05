@@ -128,6 +128,26 @@ jobs:
           if not path.is_file() and os.environ['INIT_DATA'] != 'true':
               raise SystemExit('No saved seed. Supply the ORIGINAL seed for an existing installation, or select init_data for a FIRST installation')
           PY
+      - name: WCN7850 firmware
+        if: inputs.os == '27'
+        working-directory: device/firmware/wcn7850
+        run: |
+          # The repository holds only the manifest; linux-firmware 20261019 carries these exact files.
+          revision=a2dcb924f0897368b0b4f305cbf9808cdda90ce0
+          for name in amss.bin m3.bin board-2.bin; do
+            curl --fail --location --silent --show-error --retry 3 --output "$name" \
+              "https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/ath12k/WCN7850/hw2.0/$name?id=$revision" ||
+            curl --fail --location --silent --show-error --retry 3 --output "$name" \
+              "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/$revision/ath12k/WCN7850/hw2.0/$name"
+          done
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+          for name, expected in json.loads(pathlib.Path('manifest.json').read_text())['files'].items():
+              data = pathlib.Path(name).read_bytes()
+              if len(data) != expected['bytes'] or hashlib.sha256(data).hexdigest() != expected['sha256']:
+                  raise SystemExit('WCN7850 firmware differs from manifest: ' + name)
+              print(name, 'matches the manifest')
+          PY
       - name: Mesa patch headers
         run: |
           # git apply refuses a file creation without its "new file mode" line; the build tree links these patches.
