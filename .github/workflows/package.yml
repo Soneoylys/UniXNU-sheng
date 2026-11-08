@@ -122,6 +122,9 @@ jobs:
           if not path.is_file() and os.environ['INIT_DATA'] != 'true':
               raise SystemExit('No saved seed. Supply the ORIGINAL seed for an existing installation, or select init_data for a FIRST installation')
           PY
+      - name: Ath12kWifi sources
+        working-directory: device/drivers/Ath12kWifi
+        run: python3 tools/fetch-sources.py
       - name: package
         working-directory: device
         env:
@@ -151,6 +154,24 @@ jobs:
           path: |
             UniXNU/out/sheng/*/*/runtime/data.dbr
             UniXNU/out/sheng/*/*/runtime/inputs.json
+      - name: redact build logs
+        if: always()
+        env:
+          SEED: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+        run: |
+          mkdir -p build-logs
+          for d in UniXNU/out/sheng/*/*/logs; do
+            [ -d "$d" ] && cp -R "$d"/. build-logs/
+          done
+          find build-logs -type f -exec sed -i '' "s/$SEED/********/g" {} + 2>/dev/null || true
+      - name: build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ inputs.os }}
+          retention-days: 1
+          if-no-files-found: ignore
+          path: build-logs
       - name: images
         uses: actions/upload-artifact@v4
         with:
