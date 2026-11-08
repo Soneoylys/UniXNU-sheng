@@ -124,7 +124,20 @@ jobs:
           PY
       - name: Ath12kWifi sources
         working-directory: device/drivers/Ath12kWifi
-        run: python3 tools/fetch-sources.py
+        run: |
+          # fetch-sources.py adds leading-slash patterns, which the runner's git rejects in cone
+          # mode. Clone the locked sources in no-cone mode first; the script then verifies and fills them.
+          python3 - <<'PY'
+          import json, subprocess
+          lock = json.load(open('tools/source-lock.json'))
+          for name in ('linux', 'freebsd'):
+              source, directory = lock[name], 'deps/' + name
+              subprocess.run(['git', 'clone', '--depth', '1', '--branch', source['ref'], '--filter=blob:none',
+                              '--sparse', source['url'], directory], check=True)
+              subprocess.run(['git', '-C', directory, 'sparse-checkout', 'set', '--no-cone', '/.unixnu-placeholder'],
+                             check=True)
+          PY
+          python3 tools/fetch-sources.py
       - name: package
         working-directory: device
         env:
