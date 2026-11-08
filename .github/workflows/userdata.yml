@@ -1,0 +1,72 @@
+name: userdata
+
+# Root volume: `unixnu build userdata` writes userdata-root.img (the unchanged OS and SystemOS
+# disk images of the profile's IPSW behind a small manifest) for `fastboot flash userdata`.
+# The IPSW members are read with HTTP range requests. The image holds no platform seed and no
+# user data, so it is not tied to one device. Download the artifact, then delete the run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: "OS profile of the root volume"
+        type: choice
+        options: ["27", "26", "17"]
+        default: "27"
+      dry_run:
+        description: "Only check sizes and pins; write nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: userdata-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  userdata:
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+          submodules: recursive
+      - uses: actions/checkout@v4
+        with:
+          repository: Soneoylys/UniXNU-fork
+          ref: dd0457f20144a2ebe95231085483f9fb91a5216c # same pin as package.yml
+          path: UniXNU
+          submodules: recursive
+      - name: free space
+        run: df -h /System/Volumes/Data
+      - name: userdata root image
+        working-directory: UniXNU
+        env:
+          OS_PROFILE: ${{ inputs.os }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=(--device ../device --os "$OS_PROFILE")
+          if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
+          python3 ./unixnu build userdata "${args[@]}"
+          df -h /System/Volumes/Data
+      - name: report
+        if: always()
+        run: |
+          for f in UniXNU/out/sheng/*/*/userdata/userdata-root.json; do
+            [ -f "$f" ] && { echo "$f"; cat "$f"; }
+          done
+          ls -l UniXNU/out/sheng/*/*/userdata/ || true
+      - name: root volume
+        if: inputs.dry_run != true
+        uses: actions/upload-artifact@v4
+        with:
+          name: userdata-root-${{ inputs.os }}
+          retention-days: 1
+          compression-level: 1
+          if-no-files-found: error
+          path: |
+            UniXNU/out/sheng/*/*/userdata/userdata-root.img
+            UniXNU/out/sheng/*/*/userdata/userdata-root.json
