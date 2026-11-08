@@ -40,6 +40,10 @@ jobs:
           ref: dd0457f20144a2ebe95231085483f9fb91a5216c # same pin as package.yml
           path: UniXNU
           submodules: recursive
+      - name: tools
+        run: |
+          brew install blacktop/tap/ipsw
+          command -v ipsw
       - name: free space
         run: df -h /System/Volumes/Data
       - name: userdata root image
