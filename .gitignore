@@ -46,3 +46,4 @@ firmware/wcn7850/*.bin
 *.key
 .env
 local.toml
+HANDOFF.md

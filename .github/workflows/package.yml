@@ -42,8 +42,8 @@ jobs:
           submodules: recursive
       - uses: actions/checkout@v4
         with:
-          repository: UniXNU/UniXNU
-          ref: 82b847c4ac3f68a57024b3082ffa3a03442defd9 # Wi-Fi runtime and Data firmware integration
+          repository: Soneoylys/UniXNU-fork
+          ref: 79fb946072942528f4f2e93609cb32d9362a4888 # 82b847c4 plus the turnip-frame-diagnostics.patch new file mode fix
           path: UniXNU
           submodules: recursive
       - uses: actions/checkout@v4
