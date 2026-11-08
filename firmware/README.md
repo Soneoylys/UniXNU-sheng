@@ -1,8 +1,9 @@
 # WCN7850 firmware inputs
 
 Place amss.bin, m3.bin and board-2.bin under `wcn7850/`.
-`wcn7850/manifest.json` pins their sizes and SHA-256 hashes. Firmware binaries
-stay local; the repository contains the manifest and packaging code.
+`wcn7850/manifest.json` pins their sizes and SHA-256 hashes. The three
+WCN7850 binaries are committed (force-added past the `.gitignore` rule) so CI can build;
+other firmware stays local.
 
 `scripts/build-wifi-userspace.py OUT ios27` validates the inputs and stages
 them for the Data addon. `package/WifiFirmware.h` defines the shared loader
