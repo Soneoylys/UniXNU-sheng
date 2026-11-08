@@ -43,7 +43,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Soneoylys/UniXNU-fork
-          ref: 79fb946072942528f4f2e93609cb32d9362a4888 # 82b847c4 plus the turnip-frame-diagnostics.patch new file mode fix
+          ref: dd0457f20144a2ebe95231085483f9fb91a5216c # UniXNU main 5dc00d20 plus the turnip-frame-diagnostics.patch new file mode fix
           path: UniXNU
           submodules: recursive
       - uses: actions/checkout@v4
@@ -175,6 +175,9 @@ jobs:
           mkdir -p build-logs
           for d in UniXNU/out/sheng/*/*/logs; do
             [ -d "$d" ] && cp -R "$d"/. build-logs/
+          done
+          for f in UniXNU/out/sheng/*/*/tree/build/xnu/fileset-reference/*/*-build.log; do
+            [ -f "$f" ] && cp "$f" "build-logs/fileset-reference-$(basename "$(dirname "$f")")-$(basename "$f")"
           done
           find build-logs -type f -exec sed -i '' "s/$SEED/********/g" {} + 2>/dev/null || true
       - name: build logs
