@@ -42,8 +42,16 @@ jobs:
           submodules: recursive
       - name: tools
         run: |
-          brew install blacktop/tap/ipsw
+          # The release assets of blacktop/ipsw answered 504 for hours on 2026-11-08, so the formula
+          # install can fail; build the same tag from source then.
+          if ! brew install blacktop/tap/ipsw; then
+            brew install go
+            GOBIN="$HOME/.local/bin" go install github.com/blacktop/ipsw/cmd/ipsw@v3.1.743
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.local/bin:$PATH"
+          fi
           command -v ipsw
+          ipsw version || true
       - name: free space
         run: df -h /System/Volumes/Data
       - name: userdata root image
