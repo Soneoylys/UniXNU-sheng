@@ -64,6 +64,98 @@ jobs:
           if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
           python3 ./unixnu build userdata "${args[@]}"
           df -h /System/Volumes/Data
+      - name: root policy tables
+        # The boot image carries only the 544-byte signed VerifiedRoot headers
+        # (scripts/policies/<profile>/<window>/manifest.header.bin, CONFIG_XNU_SOURCE_STORAGE_TABLES="userdata").
+        # NativeUfs reads each hash table from the root image object "<window>.vroot"; without it, root step 3
+        # fails with "root window preparation failed". The table is the SHA-256 of every 4096-byte block of
+        # the window (VerifiedRoot tools/manifest.py), so it is rebuilt here and checked against the signed header.
+        if: inputs.dry_run != true
+        run: |
+          python3 - <<'PY2'
+          import hashlib, json, pathlib, struct, sys
+          report_path = next(pathlib.Path('UniXNU/out/sheng').glob('*/*/userdata/userdata-root.json'))
+          profile = report_path.parts[3]
+          policies = pathlib.Path('device/scripts/policies') / profile
+          if not policies.is_dir():
+              sys.exit(f'no signed root policies for {profile} under {policies}')
+          report = json.loads(report_path.read_text())
+          image = report_path.with_suffix('.img')
+          out = pathlib.Path('vroot'); out.mkdir()
+          with image.open('rb') as handle:
+              for window in report['windows']:
+                  name = window['name']
+                  header = (policies / name / 'manifest.header.bin').read_bytes()
+                  record = json.loads((policies / name / 'verification.json').read_text())
+                  magic, _, _, block, _, image_bytes, count = struct.unpack_from('<8s4I2Q', header)
+                  table_digest = header[88:120]
+                  print(f'{name}: window {window["size"]} bytes sha256 {window["sha256"]}')
+                  print(f'{name}: policy {image_bytes} bytes sha256 {record["image_sha256"]} blocks {count}')
+                  if magic != b'VROOT01\0' or block != 4096 or len(header) != 544:
+                      sys.exit(f'{name}: unexpected policy header')
+                  if window['size'] != image_bytes or window['sha256'] != record['image_sha256']:
+                      sys.exit(f'{name}: the IPSW disk image differs from the signed policy (size or SHA-256)')
+                  table, digest = bytearray(), hashlib.sha256()
+                  handle.seek(window['offset'])
+                  remaining = image_bytes
+                  while remaining:
+                      data = handle.read(min(4096, remaining))
+                      if not data:
+                          sys.exit(f'{name}: short read')
+                      table += hashlib.sha256(data).digest()
+                      remaining -= len(data)
+                  if len(table) != count * 32 or hashlib.sha256(table).digest() != table_digest:
+                      sys.exit(f'{name}: rebuilt hash table does not match the signed header')
+                  (out / f'{name}.vroot').write_bytes(table)
+                  print(f'{name}.vroot: {len(table)} bytes, sha256 {hashlib.sha256(table).hexdigest()} (matches signed header)')
+          (out / 'pass1.json').write_text(json.dumps(report['windows']))
+          PY2
+      - name: userdata root image with policy tables
+        if: inputs.dry_run != true
+        working-directory: UniXNU
+        env:
+          OS_PROFILE: ${{ inputs.os }}
+        run: |
+          objects=()
+          for t in ../vroot/*.vroot; do objects+=(--object "$(basename "$t")=$t"); done
+          python3 ./unixnu build userdata --device ../device --os "$OS_PROFILE" "${objects[@]}"
+      - name: policy table delta
+        # The objects follow the windows, so an image flashed from the previous build only needs the
+        # manifest block and the two tables. The delta is refused unless the windows are unchanged.
+        if: inputs.dry_run != true
+        run: |
+          python3 - <<'PY2'
+          import hashlib, json, pathlib, sys
+          report_path = next(pathlib.Path('UniXNU/out/sheng').glob('*/*/userdata/userdata-root.json'))
+          report = json.loads(report_path.read_text())
+          if report['windows'] != json.loads(pathlib.Path('vroot/pass1.json').read_text()):
+              sys.exit('windows moved between the two builds')
+          image = report_path.with_suffix('.img')
+          out = pathlib.Path('vroot-delta'); out.mkdir()
+          parts = [('manifest', 0, 4096)] + [(o['name'], o['offset'], o['size']) for o in report['objects']]
+          rows = []
+          with image.open('rb') as handle:
+              for name, offset, size in parts:
+                  handle.seek(offset)
+                  data = handle.read(size)
+                  if offset % 4096 or len(data) != size:
+                      sys.exit(f'{name}: bad region')
+                  data += bytes(-len(data) % 4096)
+                  (out / f'{name}.bin').write_bytes(data)
+                  rows.append({'file': f'{name}.bin', 'seek_4k': offset // 4096, 'count_4k': len(data) // 4096,
+                               'sha256': hashlib.sha256(data).hexdigest()})
+          (out / 'delta.json').write_text(json.dumps({'windows': report['windows'], 'parts': rows,
+                                                      'image_sha256': report['image_sha256']}, indent=2) + '\n')
+          print((out / 'delta.json').read_text())
+          PY2
+      - name: policy table delta artifact
+        if: inputs.dry_run != true
+        uses: actions/upload-artifact@v4
+        with:
+          name: userdata-vroot-delta-${{ inputs.os }}
+          retention-days: 1
+          if-no-files-found: error
+          path: vroot-delta
       - name: report
         if: always()
         run: |
