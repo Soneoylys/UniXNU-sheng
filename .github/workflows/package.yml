@@ -138,6 +138,11 @@ jobs:
                              check=True)
           PY
           python3 tools/fetch-sources.py
+      - name: keyboard firmware
+        # build-gop-legacy-display-27.py needs nanosic/MCU_Upgrade.bin in .cache/firmware. extract-files.py
+        # downloads it from the pinned public mirror (@fetch in proprietary-files.txt) and checks its SHA-256.
+        working-directory: device
+        run: python3 scripts/extract-files.py --section Keyboard
       - name: package
         working-directory: device
         env:
