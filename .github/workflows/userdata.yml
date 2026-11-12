@@ -36,8 +36,8 @@ jobs:
           submodules: recursive
       - uses: actions/checkout@v4
         with:
-          repository: Soneoylys/UniXNU-fork
-          ref: 00db0e02b1a8d571e589b9cf74785c2c36643790 # same pin as package.yml
+          repository: UniXNU/UniXNU
+          ref: 2bbb39dcee0cada3b04e41f0256d678e80667c5b # same pin as package.yml
           path: UniXNU
           submodules: recursive
       - name: tools

@@ -42,8 +42,8 @@ jobs:
           submodules: recursive
       - uses: actions/checkout@v4
         with:
-          repository: Soneoylys/UniXNU-fork
-          ref: 00db0e02b1a8d571e589b9cf74785c2c36643790 # UniXNU main 8ec13bb6 plus the turnip-frame-diagnostics.patch new file mode fix and XnuPrelink at its newest main
+          repository: UniXNU/UniXNU
+          ref: 2bbb39dcee0cada3b04e41f0256d678e80667c5b # UniXNU main; it carries the Turnip patch new file mode fix and every submodule at its newest main
           path: UniXNU
           submodules: recursive
       - uses: actions/checkout@v4
