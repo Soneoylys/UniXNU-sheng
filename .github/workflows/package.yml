@@ -146,6 +146,21 @@ jobs:
         run: |
           python3 scripts/extract-files.py --section Keyboard
           python3 scripts/extract-files.py --section Video
+      - name: prelink layout report
+        # Diagnostic only: XnuPrelink's collision error then names the native code end and the collection data address,
+        # so a kernel that is too large reports by how much.
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('UniXNU/kits/XnuPrelink/fileset_layout.py')
+          s = p.read_text()
+          old = "raise ValueError('Native code would collide with collection data')"
+          new = ("raise ValueError(f'Native code would collide with collection data: native __TEXT_EXEC {self.placements[\"__TEXT_EXEC\"]:#x}, '"
+                 " f'code end {code_end:#x}, __DATA {self.roots[\"__DATA\"][\"va\"]:#x}, '"
+                 " f'over by {code_end - self.roots[\"__DATA\"][\"va\"]} bytes')")
+          if old in s:
+              p.write_text(s.replace(old, new))
+          PY
       - name: package
         working-directory: device
         env:

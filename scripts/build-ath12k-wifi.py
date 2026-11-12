@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compile the WiFi module (Ath12kWifi) to kernel objects for the board build. Usage: build-ath12k-wifi.py <module dir> <output dir>
 Prints one line "OBJ <path>" per object. The module fetches its pinned public sources with tools/fetch-sources.sh and lays out its generated include trees with tools/prepare.sh first."""
-import hashlib, json, shlex, shutil, subprocess, sys
+import hashlib, json, os, shlex, shutil, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -17,7 +17,10 @@ subprocess.run(['bash', str(module / 'tools/fetch-sources.sh')], check=True, std
 subprocess.run(['bash', str(module / 'tools/prepare.sh')], check=True, stdout=subprocess.DEVNULL)
 clang = subprocess.run(['xcrun', '-f', 'clang'], check=True, capture_output=True, text=True).stdout.strip()
 resource = subprocess.run([clang, '-print-resource-dir'], check=True, capture_output=True, text=True).stdout.strip() + '/include'
-flags = ['-target', TRIPLE, '-mkernel', '-O2', '-g0', '-ffreestanding', '-fno-builtin', '-fno-common', '-fno-strict-aliasing', '-fwrapv',
+# -Os on iPadOS: the native kernel text of the 24A446 collection has little room left below the collection data, and the
+# WiFi stack is its largest board part (about 900 KiB at -O2). macOS keeps -O2.
+OPTIMIZE = '-O2' if os.environ.get('UNIXNU_XNU_TARGET') == 'macosx' else '-Os'
+flags = ['-target', TRIPLE, '-mkernel', OPTIMIZE, '-g0', '-ffreestanding', '-fno-builtin', '-fno-common', '-fno-strict-aliasing', '-fwrapv',
          '-fno-stack-protector', '-Wno-incompatible-pointer-types', '-Wno-error', '-fno-delete-null-pointer-checks', '-mgeneral-regs-only', '-momit-leaf-frame-pointer', '-std=gnu11', '-w',
          '-DCONFIG_ATH12K_DEBUG', '-DCONFIG_CFG80211=1', '-DCONFIG_MAC80211=1',
          '-DCONFIG_MAC80211_STA_HASH_MAX_SIZE=0', '-DCONFIG_MAC80211_RC_DEFAULT=""',
