@@ -284,6 +284,11 @@ r = json.loads((ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELO
 source = ROOT / 'kits/sheng/LegacyDisplayProbe.cpp'
 
 
+# The kernel's recipes compile with -O2. On iPadOS the board objects take -Os: the native text of the 24A446 collection runs into its
+# __DATA otherwise (package run #12 was 32 KiB over with the WiFi stack already at -Os). macOS keeps the kernel's flags.
+BOARD_OPTIMIZE = () if MACOS else ('-Os',)
+
+
 def compile_cpp(src, dst, extra=()):
     cmd, args, i = [], r['arguments'], 0
     while i < len(args):
@@ -301,7 +306,7 @@ def compile_cpp(src, dst, extra=()):
             cmd.append(value)
         i += 1
     cmd += ['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-Wno-unnecessary-virtual-specifier', '-Wno-c99-designator',
-            '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion', '-I', str(ROOT / '.cache/xnu-work/osfmk'), *extra]
+            '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion', '-I', str(ROOT / '.cache/xnu-work/osfmk'), *BOARD_OPTIMIZE, *extra]
     run(cmd, cwd=r['directory'])
 
 
@@ -322,7 +327,7 @@ def compile_c(src, dst, recipe='osfmk/DEVELOPMENT/startup.o.json'):
         elif not value.startswith('-W'):
             cmd.append(value)
         i += 1
-    cmd += ['-Wall', '-Wextra', '-Werror', '-mgeneral-regs-only', '-I', str(ROOT / '.cache/xnu-work/osfmk'), '-I', str(ROOT / 'kits/sheng')]
+    cmd += ['-Wall', '-Wextra', '-Werror', '-mgeneral-regs-only', '-I', str(ROOT / '.cache/xnu-work/osfmk'), '-I', str(ROOT / 'kits/sheng'), *BOARD_OPTIMIZE]
     run(cmd, cwd=rc['directory'])
 
 
