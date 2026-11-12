@@ -541,6 +541,10 @@ for stem in ('QcomMdt', 'FatVolume', 'QcomQrtr', 'ShengQrtr', 'QcomSmem', 'QcomS
              'ShengGpr', 'ShengAudioReach', 'ShengCs35l43', 'MhiBoot', 'GeniI2c', 'Wn8030'):
     compile_c(KITS / (stem + '.c'), board_dir / (stem + '.o'))
     board_objects.append(board_dir / (stem + '.o'))
+# iPadOS: weak definitions for the imports that only the macOS kernel patches and board objects define (IpadosWeakDefaults.c).
+if not MACOS:
+    compile_c(KITS / 'IpadosWeakDefaults.c', board_dir / 'IpadosWeakDefaults.o')
+    board_objects.append(board_dir / 'IpadosWeakDefaults.o')
 # The keyboard controller's RAM image, the pinned file of proprietary-files.txt (scripts/extract-files.py --section Keyboard), as data.
 keyboard_firmware = next((path for path in (DEVICE / '.cache/firmware/nanosic/MCU_Upgrade.bin', ROOT / '.cache/firmware/nanosic/MCU_Upgrade.bin')
                           if path.is_file()), None)
@@ -901,6 +905,8 @@ for directory in ('include', 'kernel', 'src', 'shim'):
 sources += [KITS / name for name in ('SmmuBypass.h', 'AppsSmmuLock.h', 'UsbProbe.cpp')]
 sources += [KITS / name for name in ('KeyboardCover.cpp', 'KeyboardProbe.cpp', 'Wn8030.c', 'Wn8030.h', 'GeniI2c.c', 'GeniI2c.h')]
 sources += [keyboard_firmware]
+if not MACOS:
+    sources.append(KITS / 'IpadosWeakDefaults.c')
 sources += [USB / 'QcomDwc3.cpp', USB / 'QcomEusb2Phy.h', USB / 'QcomQmpUsb3.h', USB / 'QcomUcsi.h', ROOT / f'scripts/usb-xdci-{BUILD}.json', ROOT / f'scripts/usb-xhci-{BUILD}.json']
 
 
