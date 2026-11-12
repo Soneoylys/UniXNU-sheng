@@ -87,17 +87,46 @@ struct Note {   /* what the event thread hands to the sink */
     uint32_t event;
 };
 
-Media gTable[MaxSessions];
+/* The session table (MaxSessions entries, 104 KiB) and the ring (RingSize notes, 42 KiB) are allocated by tables() when the device
+ * is first used: the iPadOS kernel's __DATA has no room for them below the collection's retained kexts. */
+Media *gTable;
 uint32_t gNextId = 1;
-Note gRing[RingSize];
+Note *gRing;
 uint32_t gHead, gTail;          /* under the device's lock */
 bool gThreadStarted;
 void (*gSink)(void *, const uint8_t *, uint32_t);
 void *gSinkContext;
 
 IOLock *lock() { return QcomIrisDeviceLock(); }
+
+/* Without the lock held (the allocation may block): the table and the ring, published together under the lock. */
+bool tables() {
+    IOLockLock(lock());
+    const bool have = gRing != nullptr;
+    IOLockUnlock(lock());
+    if (have) return true;
+    Media *table = static_cast<Media *>(IOMallocZero(sizeof(Media) * MaxSessions));
+    Note *ring = static_cast<Note *>(IOMallocZero(sizeof(Note) * RingSize));
+    if (table && ring) {
+        IOLockLock(lock());
+        if (!gRing) {
+            gTable = table;
+            gRing = ring;
+            table = nullptr;
+            ring = nullptr;
+        }
+        IOLockUnlock(lock());
+    }
+    if (table) IOFree(table, sizeof(Media) * MaxSessions);
+    if (ring) IOFree(ring, sizeof(Note) * RingSize);
+    IOLockLock(lock());
+    const bool ready = gRing != nullptr;
+    IOLockUnlock(lock());
+    return ready;
+}
+
 Media *find(uint32_t id) {
-    for (Media &m : gTable) if (m.used && m.id == id) return &m;
+    if (gTable) for (unsigned i = 0; i < MaxSessions; ++i) if (gTable[i].used && gTable[i].id == id) return &gTable[i];
     return nullptr;
 }
 Media *ofIris(struct qcom_iris_session *is) {
@@ -426,7 +455,7 @@ bool iris_media_is_up(unsigned device) { return device == IrisMediaDecoder && Qc
 const char *iris_media_card(unsigned device) { return device == IrisMediaDecoder ? "iris decoder" : ""; }
 
 void iris_media_set_sink(unsigned device, void (*sink)(void *, const uint8_t *, uint32_t), void *context) {
-    if (device != IrisMediaDecoder || !QcomIrisDeviceReady()) return;
+    if (device != IrisMediaDecoder || !QcomIrisDeviceReady() || !tables()) return;
     IOLockLock(lock());
     gSink = sink;
     gSinkContext = context;
@@ -441,9 +470,10 @@ void iris_media_set_sink(unsigned device, void (*sink)(void *, const uint8_t *, 
 
 int iris_media_open(unsigned device, uint32_t *session) {
     if (!iris_media_is_up(device) || !session) return Enodev;
+    if (!tables()) return Enomem;
     IOLockLock(lock());
     Media *m = nullptr;
-    for (Media &candidate : gTable) if (!candidate.used) { m = &candidate; break; }
+    for (unsigned i = 0; i < MaxSessions; ++i) if (!gTable[i].used) { m = &gTable[i]; break; }
     if (m) {
         memset(m, 0, sizeof *m);
         m->used = true;

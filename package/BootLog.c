@@ -186,9 +186,10 @@ extern volatile uint32_t native_wifi_ev[48] __attribute__((weak_import));
 extern volatile uint32_t native_wifi_ldo[24] __attribute__((weak_import));
 extern volatile uint32_t native_wifi_mhi[16] __attribute__((weak_import));
 extern volatile uint32_t native_wifi_mhi_ms[8] __attribute__((weak_import));
-extern char native_wifi_text[512][112] __attribute__((weak_import));
+/* WifiProbe.cpp allocates the rings: 512 lines of text, 128 of notes. */
+extern char (*native_wifi_text)[112] __attribute__((weak_import));
 extern volatile uint32_t native_wifi_text_n __attribute__((weak_import));
-extern char native_wifi_note[128][112] __attribute__((weak_import));
+extern char (*native_wifi_note)[112] __attribute__((weak_import));
 extern volatile uint32_t native_wifi_note_n __attribute__((weak_import));
 extern int native_ufs_extra_fault(uint32_t *) __attribute__((weak_import));
 extern struct {uint32_t stage, scans, frames, beacons, bss_seen; int last_err;} nw_wifi_stats __attribute__((weak_import));
@@ -269,7 +270,8 @@ extern volatile uint32_t vt_host_sessions __attribute__((weak_import)), vt_host_
     vt_host_frames_out __attribute__((weak_import)), vt_host_frames_dropped __attribute__((weak_import)),
     vt_host_errors __attribute__((weak_import)), vt_host_error_stage __attribute__((weak_import));
 extern volatile int32_t vt_host_error_value __attribute__((weak_import));
-extern char vt_host_trace[64][112] __attribute__((weak_import));
+/* VtHost.cpp allocates the ring of 64 lines. */
+extern char (*vt_host_trace)[112] __attribute__((weak_import));
 extern volatile uint32_t vt_host_trace_count __attribute__((weak_import));
 extern volatile uint32_t iris_media_stats[14] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_recovery_fault[5] __attribute__((weak_import));
@@ -1240,7 +1242,7 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
       at = put(out, at, cap, row, sizeof row);
     }
     // [video vt log]: the host's last 64 lines (VtHost.cpp, trace), oldest first.
-    if (&vt_host_trace_count && vt_host_trace_count) {
+    if (&vt_host_trace_count && vt_host_trace_count && &vt_host_trace && vt_host_trace) {
       const uint32_t n = vt_host_trace_count;
       for (uint32_t i = n > 64 ? n - 64 : 0; i < n; ++i) {
         snprintf(row, sizeof row, "[video vt log] %u %.110s", i, vt_host_trace[i % 64]);
@@ -1723,7 +1725,7 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
           at = put(out, at, cap, row, sizeof row);
         }
       }
-      if (&native_wifi_text && native_wifi_text_n) {
+      if (&native_wifi_text && native_wifi_text && native_wifi_text_n) {
         if (&nw_wifi_stats) {
           snprintf(row, sizeof row, "[wifi-nw] stage=%u scans=%u frames=%u beacons=%u networks=%u err=%d lines=%u", nw_wifi_stats.stage, nw_wifi_stats.scans, nw_wifi_stats.frames,
                    nw_wifi_stats.beacons, nw_wifi_stats.bss_seen, nw_wifi_stats.last_err, native_wifi_text_n);
@@ -1751,7 +1753,7 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
         }
         shown = i;
         // the notices among them, which the debug lines cannot push out of their own ring: at most 40 new ones per slot
-        if (&native_wifi_note) {
+        if (&native_wifi_note && native_wifi_note) {
           static uint32_t noted;
           const uint32_t m = native_wifi_note_n;
           uint32_t j = noted;

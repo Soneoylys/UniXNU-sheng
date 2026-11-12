@@ -4,4 +4,6 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+static inline void *IOMallocZero(size_t size) { return calloc(1, size); }
+static inline void IOFree(void *address, size_t) { free(address); }
 #endif

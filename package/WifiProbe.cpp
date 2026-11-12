@@ -80,9 +80,10 @@ volatile uint32_t native_wifi_mhi[16];
 // [4] the boot loader was started, [5] the contexts were programmed, [6] the run ended.
 volatile uint32_t native_wifi_mhi_ms[8];
 // The WiFi module's messages: a ring of 512 lines, newest at native_wifi_text_n - 1.
-char native_wifi_text[512][112]; volatile uint32_t native_wifi_text_n;
 // The same messages of level 6 and below (notices, warnings, errors) in a ring of their own, which the driver's debug lines do not push out.
-char native_wifi_note[128][112]; volatile uint32_t native_wifi_note_n;}
+// sheng_wifi_probe allocates both rings (70 KiB): the iPadOS kernel's __DATA has no room for them below the collection's retained kexts.
+char (*native_wifi_text)[112]; volatile uint32_t native_wifi_text_n;
+char (*native_wifi_note)[112]; volatile uint32_t native_wifi_note_n;}
 
 extern kmod_info_t g_kernel_kmod_info;
 extern "C" void native_wifi_net_static_init(void) __asm__("__GLOBAL__sub_I_WifiNet.cpp");
@@ -738,13 +739,14 @@ void pLog(int level, const char *line) {
     for (const char *c = line; *c; ++c) h = (h ^ static_cast<uint8_t>(*c)) * 16777619u;
     h ^= static_cast<uint32_t>(level);
     for (uint32_t r : recent) if (r == h) {++gLogRepeats; return;}
+    if (!native_wifi_text) {++gLogRepeats; return;}
     memmove(&recent[1], &recent[0], sizeof recent - sizeof recent[0]);
     recent[0] = h;
     const uint64_t now = pNow();
     if (!first) first = now;
     const uint32_t i = __atomic_fetch_add(const_cast<uint32_t *>(&native_wifi_text_n), 1u, __ATOMIC_RELAXED) % 512;
     snprintf(native_wifi_text[i], sizeof native_wifi_text[i], "%u %d %.100s", static_cast<uint32_t>(now - first), level, line);
-    if (level <= 6) {
+    if (level <= 6 && native_wifi_note) {
         const uint32_t j = __atomic_fetch_add(const_cast<uint32_t *>(&native_wifi_note_n), 1u, __ATOMIC_RELAXED) % 128;
         memcpy(native_wifi_note[j], native_wifi_text[i], sizeof native_wifi_note[j]);
     }
@@ -1693,6 +1695,15 @@ extern "C" int sheng_wifi_file(const char *name, const uint8_t **data, size_t *s
 extern "C" void sheng_wifi_probe(void) {
     unsigned stage = 0;
     if (!PE_parse_boot_argn("wifi", &stage, sizeof stage) || stage < 1 || native_wifi_stats[0]) return;
+    // the message rings, before the module's first line
+    char (**rings[2])[112] = {&native_wifi_text, &native_wifi_note};
+    const size_t lines[2] = {512, 128};
+    for (unsigned r = 0; r < 2; ++r) {
+        if (*rings[r]) continue;
+        void *bytes = IOMallocData(lines[r] * 112);
+        if (bytes) memset(bytes, 0, lines[r] * 112);
+        *rings[r] = static_cast<char (*)[112]>(bytes);
+    }
     thread_t thread = nullptr;
     if (kernel_thread_start(wifiThread, reinterpret_cast<void *>(uintptr_t(stage)), &thread) == KERN_SUCCESS) thread_deallocate(thread);
     else native_wifi_stats[0] = -7;

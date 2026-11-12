@@ -66,8 +66,9 @@ volatile uint32_t vt_host_frames_skipped;   // of those, never given to the devi
 volatile uint32_t vt_host_error_stage;
 volatile int32_t vt_host_error_value;
 volatile uint32_t vt_host_replies, vt_host_unknown, vt_host_last_unknown;
-// The host's last diagnostic lines, a ring of 64 (the kernel's message buffer turns over too fast to keep them).
-char vt_host_trace[64][112];
+// The host's last diagnostic lines, a ring of 64 (the kernel's message buffer turns over too fast to keep them). vt_host_client_open
+// allocates it: the iPadOS kernel's __DATA has no room for it below the collection's retained kexts.
+char (*vt_host_trace)[112];
 volatile uint32_t vt_host_trace_count;
 }
 
@@ -75,10 +76,12 @@ namespace {
 
 void trace(const char *format, ...) __attribute__((format(printf, 1, 2)));
 void trace(const char *format, ...) {
+    char (*ring)[112] = __atomic_load_n(&vt_host_trace, __ATOMIC_ACQUIRE);
+    if (!ring) return;
     const uint32_t n = __atomic_fetch_add(&vt_host_trace_count, 1, __ATOMIC_RELAXED);
     va_list arguments;
     va_start(arguments, format);
-    vsnprintf(vt_host_trace[n % 64], sizeof vt_host_trace[0], format, arguments);
+    vsnprintf(ring[n % 64], sizeof ring[0], format, arguments);
     va_end(arguments);
 }
 
@@ -2746,6 +2749,16 @@ extern "C" {
 bool vt_host_available(void) { return decoderDevice() != ~0u || encoderDevice() != ~0u; }
 
 void *vt_host_client_open(void *transport, bool (*send)(void *, const uint8_t *, uint32_t), task_t task, int pid) {
+    if (!__atomic_load_n(&vt_host_trace, __ATOMIC_ACQUIRE)) {
+        void *bytes = IOMallocData(64 * 112);
+        if (bytes) {
+            memset(bytes, 0, 64 * 112);
+            char (*expected)[112] = nullptr;
+            if (!__atomic_compare_exchange_n(&vt_host_trace, &expected, static_cast<char (*)[112]>(bytes), false, __ATOMIC_ACQ_REL,
+                                             __ATOMIC_ACQUIRE))
+                IOFreeData(bytes, 64 * 112);
+        }
+    }
     if (!gTableLock) {
         IOLock *lock = IOLockAlloc();
         if (!OSCompareAndSwapPtr(nullptr, lock, &gTableLock)) IOLockFree(lock);
