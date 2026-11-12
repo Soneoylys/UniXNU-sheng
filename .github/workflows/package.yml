@@ -138,11 +138,14 @@ jobs:
                              check=True)
           PY
           python3 tools/fetch-sources.py
-      - name: keyboard firmware
-        # build-gop-legacy-display-27.py needs nanosic/MCU_Upgrade.bin in .cache/firmware. extract-files.py
-        # downloads it from the pinned public mirror (@fetch in proprietary-files.txt) and checks its SHA-256.
+      - name: keyboard and video firmware
+        # build-gop-legacy-display-27.py needs nanosic/MCU_Upgrade.bin and stage-video-firmware.py needs
+        # qcom/sm8550/sheng/vpu30_4v.mbn in .cache/firmware. extract-files.py downloads them from the pinned
+        # public mirror (@fetch in proprietary-files.txt) and checks their SHA-256.
         working-directory: device
-        run: python3 scripts/extract-files.py --section Keyboard
+        run: |
+          python3 scripts/extract-files.py --section Keyboard
+          python3 scripts/extract-files.py --section Video
       - name: package
         working-directory: device
         env:

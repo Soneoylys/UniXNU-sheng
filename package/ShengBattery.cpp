@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// The battery as iOS reads it (boot argument sheng-battery=1, started by BatteryProbe.cpp; needs sheng-adsp=2): an IOPMPowerSource whose
+// The battery as iOS reads it (boot argument battery=1, started by BatteryProbe.cpp; needs adsp=2): an IOPMPowerSource whose
 // values come from the battery manager in the audio DSP over the PMIC GLINK channel (ShengBattmgr.c). powerd finds every IOPMPowerSource,
 // reads CurrentCapacity/MaxCapacity, IsCharging, ExternalConnected, voltage, amperage and AdapterDetails and listens for the status change
 // message updateStatus sends; the status bar, the lock screen's charging state and Settings > Battery follow from that.
@@ -8,7 +8,7 @@
 // IOInterruptEventSource (no provider: a software event), so the DSP thread never waits for this driver. One request is in flight at a
 // time; a 2 s timer gives up on an unanswered one. Battery notifications start a refresh at once, and a 60 s timer refreshes in any case
 // (the fields that hardly change, every tenth time). Charging itself is the DSP firmware's; the one setting written is the input current
-// limit on a computer's USB port (ShengBattmgr.c; boot argument sheng-usb-sdp-ma, 0 leaves the firmware's limit).
+// limit on a computer's USB port (ShengBattmgr.c; boot argument usb-sdp-ma, 0 leaves the firmware's limit).
 #include <IOKit/IOLib.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
@@ -69,6 +69,10 @@ class ShengBattery : public IOPMPowerSource {
     ShengAdspChannel *channel = nullptr;
     IOTimerEventSource *ucsiTimer = nullptr;
     uint8_t ucsiOut[kMessage];
+    // Diagnosis (boot argument ucsi-delay, seconds): the first UCSI command (PPM_RESET) waits this long after the channel came up, so the
+    // charger rows before it show what the port was doing without the reset.
+    uint32_t ucsiDelayMs = 0;
+    bool ucsiPending = false;
 
     void ucsiSend(uint32_t n) {
         if (n) sheng_adsp_send(channel, ucsiOut, n);
@@ -76,6 +80,11 @@ class ShengBattery : public IOPMPowerSource {
     }
     static void ucsiTick(OSObject *owner, IOTimerEventSource *) {
         ShengBattery *self = OSDynamicCast(ShengBattery, owner);
+        if (self && self->wasUp && self->ucsiPending) {
+            self->ucsiPending = false;
+            if (qcom_ucsi_start) self->ucsiSend(qcom_ucsi_start(self->ucsiOut));
+            return;
+        }
         if (self && self->wasUp && qcom_ucsi_tick) self->ucsiSend(qcom_ucsi_tick(self->ucsiOut));
     }
 
@@ -211,7 +220,8 @@ class ShengBattery : public IOPMPowerSource {
                 native_battery_stats[0] = self->published ? 4 : 3;
                 uint8_t enable[SHENG_BATTMGR_ENABLE_BYTES];
                 sheng_adsp_send(self->channel, enable, sheng_battmgr_enable_request(enable));
-                if (qcom_ucsi_start) self->ucsiSend(qcom_ucsi_start(self->ucsiOut));
+                if (qcom_ucsi_start && self->ucsiDelayMs) {self->ucsiPending = true; self->ucsiTimer->setTimeoutMS(self->ucsiDelayMs);}
+                else if (qcom_ucsi_start) self->ucsiSend(qcom_ucsi_start(self->ucsiOut));
                 sheng_battmgr_refresh(&self->bm, 1);
                 self->pump();
                 self->refresh->setTimeoutMS(kRefreshMs);
@@ -260,8 +270,10 @@ public:
     bool startBattery() {
         sheng_battmgr_init(&bm);
         uint32_t ma = 0;
-        if (PE_parse_boot_argn("sheng-usb-sdp-ma", &ma, sizeof ma)) bm.sdp_limit_ua = ma > 3000 ? 3000000u : ma * 1000u;
+        if (PE_parse_boot_argn("usb-sdp-ma", &ma, sizeof ma)) bm.sdp_limit_ua = ma > 3000 ? 3000000u : ma * 1000u;
         sdpLimit = bm.sdp_limit_ua;
+        uint32_t delay = 0;
+        if (PE_parse_boot_argn("ucsi-delay", &delay, sizeof delay)) ucsiDelayMs = delay > 600 ? 600000u : delay * 1000u;
         loop = IOWorkLoop::workLoop();
         ringLock = IOSimpleLockAlloc();
         inbox = IOInterruptEventSource::interruptEventSource(this, &ShengBattery::inboxAction);

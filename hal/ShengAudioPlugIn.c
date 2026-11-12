@@ -3,6 +3,7 @@
 // stream (the microphones). Samples move through rings shared with the kernel service ShengAudio (package/ShengAudioAbi.h); the service
 // feeds the audio DSP. Objects: the plug-in (1), the device (2), the output stream (3), the input stream (4), the output volume (5).
 #include <CoreAudio/AudioServerPlugIn.h>
+#include <TargetConditionals.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 #if __has_feature(ptrauth_calls)
@@ -78,6 +79,12 @@ static kern_return_t call(uint32_t selector) {return gConnect ? IOConnectCallSca
 // is taken from those two instructions and the service sets the constant (on the shared page it cannot be written from here).
 static void setHostClock(void) {
     ShengAudioDiag *diag = (ShengAudioDiag *)((uint8_t *)gControl + SHENG_AUDIO_DIAG_OFFSET);
+#if TARGET_OS_OSX
+    // macOS keeps the constant in CoreAudio's __TEXT,__const, a code-signed page: rewriting it invalidated the page and the kernel killed
+    // the driver service helper (SIGKILL, Code Signature Invalid, macOS run32). The clock difference stays to be handled another way.
+    diag->host_clock_result = -2;
+    return;
+#endif
     // dlsym signs the pointer for an arm64e caller: the code is read through the stripped address and called through the signed one
     // (an arm64 build sees the signature bits only in an arm64e server, and neither reads nor calls through them).
     void *const signed_symbol = dlsym(RTLD_DEFAULT, "AudioGetHostClockFrequency");
@@ -122,7 +129,33 @@ static ULONG AddRef(void *self) {(void)self; return atomic_fetch_add(&gRefs, 1) 
 static ULONG Release(void *self) {(void)self; UInt32 r = atomic_load(&gRefs); if (r) r = atomic_fetch_sub(&gRefs, 1) - 1; return r;}
 
 // Connects at once, so the service sees the audio server load the plug-in; a failure here is retried at the first StartIO.
+// The I/O thread runs this image's code and data every cycle. Under memory pressure a page of them that was paged out costs the
+// cycle a page-in (the audio server counts it as an overload with "PageFaultsOnIOThread"), so the image's segments stay resident.
+// A refused mlock (a sandbox or a limit) changes nothing.
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <sys/mman.h>
+static void keepImageResident(void) {
+    Dl_info info;
+    if (!dladdr((const void *)&keepImageResident, &info) || !info.dli_fbase) return;
+    const struct mach_header_64 *header = info.dli_fbase;
+    if (header->magic != MH_MAGIC_64) return;
+    intptr_t slide = 0;
+    const struct load_command *command = (const struct load_command *)(header + 1);
+    const struct load_command *first = command;
+    for (uint32_t i = 0; i < header->ncmds; ++i, command = (const struct load_command *)((const uint8_t *)command + command->cmdsize)) {
+        const struct segment_command_64 *segment = (const struct segment_command_64 *)command;
+        if (command->cmd == LC_SEGMENT_64 && !strcmp(segment->segname, "__TEXT")) slide = (intptr_t)header - (intptr_t)segment->vmaddr;
+    }
+    command = first;
+    for (uint32_t i = 0; i < header->ncmds; ++i, command = (const struct load_command *)((const uint8_t *)command + command->cmdsize)) {
+        const struct segment_command_64 *segment = (const struct segment_command_64 *)command;
+        if (command->cmd != LC_SEGMENT_64 || !segment->vmsize || !strcmp(segment->segname, "__LINKEDIT")) continue;
+        (void)mlock((const void *)(uintptr_t)(segment->vmaddr + (uint64_t)slide), (size_t)segment->vmsize);
+    }
+}
 static OSStatus Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRef host) {
+    keepImageResident();
     (void)d;
     gHost = host;
     pthread_mutex_lock(&gLock);

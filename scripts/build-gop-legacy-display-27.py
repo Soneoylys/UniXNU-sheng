@@ -14,19 +14,26 @@ import struct
 import subprocess
 import sys
 from kernel_target import ARCH, IOS_VERSION, TRIPLE
-if ARCH != 'arm64e' or IOS_VERSION.split('.')[0] != '27':
-    raise SystemExit('This Legacy display builder only supports arm64e iPadOS 27 (24A446).')
+# The OS profile's build selects the class fixtures: the reviewed iPadOS 27 ones, or the macOS 27.3 ones that
+# gen-board-abi.py writes from the symbols of the macOS collection.
+BUILD = os.environ.get('UNIXNU_IPSW_BUILD') or '24A446'
+MACOS = os.environ.get('UNIXNU_XNU_TARGET') == 'macosx'
+if ARCH != 'arm64e' or IOS_VERSION.split('.')[0] != '27' or (BUILD, MACOS) not in (('24A446', False), ('26C5035r', True)):
+    raise SystemExit('This Legacy display builder supports arm64e iPadOS 27 (24A446) and macOS 27.3 (26C5035r).')
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / 'build/native-legacy-display'
 OUT.mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(ROOT / 'kits/XnuPrelink'))
-ABI_PATH = Path(__file__).resolve().with_name('legacy-display-24A446.json')
+ABI_PATH = Path(__file__).resolve().with_name(f'legacy-display-{BUILD}.json')
 abi = json.loads(ABI_PATH.read_text())
+# IOService's vtable length in this kernel and the pure-virtual target of the collection: fixed for iPadOS 27, recorded
+# in the fixture for macOS.
+BASE = abi.get('base_slots', 168)
 slide = int(abi['collection_slide'], 16)
 # Original targets are fixed collection addresses. XnuPrelink recomputes the
 # BTI/B adapter displacement after placing native text; no prior build is needed.
 slots = [(int(t, 16), int(d, 16)) for t, d in abi['slots']]
-D, R = abi['display'], abi['request']
+D, R, N = abi['display'], abi['request'], abi.get('notify', {})
 
 
 def run(cmd, **kw):
@@ -82,8 +89,11 @@ PROTOTYPES = {
     'cancelSwapsAfterTimeout': 'bool cancelSwapsAfterTimeout()',
     # Slot 316 initializes optional family state and returns void; x0 is not an IOSurface result.
     'create_default_fb_surface': 'void create_default_fb_surface()'}
+# A macOS fixture carries its own prototypes (the reference labels plus the family hooks it implements).
+PROTOTYPES = abi.get('prototypes', PROTOTYPES)
 by_slot = {slot: name for name, slot in abi['methods'].items()}
-pure = {i for i, (t, _) in enumerate(slots) if t == slots[214][0]}
+PURE_TARGET = int(abi['pure_target'], 16) if 'pure_target' in abi else slots[214][0]
+pure = {i for i, (t, _) in enumerate(slots) if t == PURE_TARGET}
 renames = []
 for base, (name, suffix) in abi['names'].items():
     mangled = f'_ZN25IOMobileFramebufferLegacy{len(name)}{name}{suffix}'
@@ -91,6 +101,13 @@ for base, (name, suffix) in abi['names'].items():
     require(discriminator(mangled) == slots[slot][1], f'Reviewed name {name} has the diversity of slot {slot}')
     renames.append(f'#define {base} {name}\n')
 leaves = ' '.join(f'LEAF({i})' for i in abi['leaves'])
+# The macOS family's swap request and notification fields (gen-board-abi.py); the iPadOS header has none of them.
+MACOS_CONSTANTS = ('#define NATIVE_LEGACY_MACOS 1\n'
+    f"static constexpr unsigned kLegacyCurrentSwap={D['current']};\n"
+    f"static constexpr unsigned kRequestDropReasons={R.get('drop_reasons', 0)},kRequestSwapInfoA={R.get('swap_info_a', 0)},kRequestSwapInfoB={R.get('swap_info_b', 0)};\n"
+    f"static constexpr unsigned kLegacySwapInfoTime={D.get('swap_info_time', 0)},kLegacySwapInfoHeld={D.get('swap_info_held', 0)};\n"
+    f"static constexpr unsigned kNotifyAsyncReference={N.get('async_reference', 0)},kNotifyMask={N.get('mask', 0)},kNotifyLastTime={N.get('last_time', 0)};\n"
+    ) if MACOS else ''
 header = f'''// SPDX-License-Identifier: BSD-2-Clause-Patent
 // Opaque ABI storage for the original iPadOS 27 (24A446) class, generated from {ABI_PATH.name}. Each original slot is declared
 // under a name whose pointer-authentication discriminator is the original slot's diversity (the names below), so original
@@ -106,7 +123,7 @@ static constexpr unsigned kRequestRect0={R['rect0']},kRequestRect1={R['rect1']},
 #define NATIVE_LEGACY_LEAVES(LEAF) {leaves}
 #define NATIVE_LEGACY_DEFAULT_SURFACE 1
 #define NATIVE_LEGACY_CANCEL_SWAPS 1
-static constexpr unsigned kLegacyDefaultSurface={D['default_surface']};
+{MACOS_CONSTANTS}static constexpr unsigned kLegacyDefaultSurface={D['default_surface']};
 {''.join(renames)}class IOMobileFramebufferLegacy : public IOService {{
  OSDeclareAbstractStructors(IOMobileFramebufferLegacy)
  unsigned char originalPrivate[{abi['instance_size']}-sizeof(IOService)];
@@ -161,7 +178,7 @@ public:
  IOReturn newUserClient(task_t,void *,UInt32,IOUserClient **) override;
  IOReturn setPowerState(unsigned long,IOService *) override;
 '''
-for i in range(168, len(slots)):
+for i in range(BASE, len(slots)):
     if i in by_slot:
         header += f' virtual {PROTOTYPES[by_slot[i]]};\n'
     elif i in pure:
@@ -221,7 +238,7 @@ require(all(compiled) and vtable + 16 + len(slots) * 8 not in entries, f'Exact o
 for i, (name, word) in enumerate(compiled):
     require(word >> 63 and word >> 48 & 1 and word >> 49 & 3 == 0 and (word >> 32) & 0xffff == slots[i][1],
             f'Slot {i} ({name}) signed with IA, address diversity and the original diversity {slots[i][1]:#x}')
-family = range(0xfffffe000a27c000, 0xfffffe000a29a000)
+family = range(*(int(x, 16) for x in abi['family_text'])) if 'family_text' in abi else range(0xfffffe000a27c000, 0xfffffe000a29a000)
 bindings = {name: int(va, 16) + slide for name, va in abi['bindings'].items()}
 owned, native = [], []
 for i, (name, _) in enumerate(compiled):
@@ -232,7 +249,7 @@ for i, (name, _) in enumerate(compiled):
         require(bindings.get(name, slots[i][0] + slide) == slots[i][0] + slide, 'One original address per name')
         bindings[name] = slots[i][0] + slide
     else:
-        require(i < 168 and slots[i][0] not in family, f'Slot {i} ({name}) is inherited unchanged by the original family')
+        require(i < BASE and slots[i][0] not in family, f'Slot {i} ({name}) is inherited unchanged by the original family')
         native.append(i)
 require(pure <= set(owned), 'Every original abstract slot is implemented by the owned backend')
 undefined = {n for n, _, k in symbols if k == 1 and 'IOMobileFramebufferLegacy' in n}
@@ -384,9 +401,9 @@ DEVICE = Path(os.environ.get('UNIXNU_DEVICE') or ROOT.parents[5] / 'UniXNU-sheng
 # The HID source is the tree's refer link (a clean pinned clone of the feed), not a hand-placed copy.
 print(run(['python3', ROOT.parents[4] / 'scripts/build-sheng-source-drivers.py', '--tree', ROOT, '--device', DEVICE], text=True), end='')
 SRC = ROOT / 'build/sheng-source-drivers'
-hid_abi = json.loads(Path(__file__).resolve().with_name('hid-device-24A446.json').read_text())
+hid_abi = json.loads(Path(__file__).resolve().with_name(f'hid-device-{BUILD}.json').read_text())
 hid_slots = [(int(t, 16), int(d, 16)) for t, d in hid_abi['slots']]
-hid_pure = {i for i, (t, _) in enumerate(hid_slots) if t == slots[214][0]}
+hid_pure = {i for i, (t, _) in enumerate(hid_slots) if t == PURE_TARGET}
 
 
 def object_symbols(data):
@@ -506,16 +523,16 @@ BLUETOOTH = Path(os.environ.get('QCA_BLUETOOTH_DIR') or
                  (ROOT / 'drivers/QcaBluetooth' if (ROOT / 'drivers/QcaBluetooth').is_dir() else DEVICE / 'drivers/QcaBluetooth'))
 require((BLUETOOTH / 'include/qbt.h').exists(), 'QcaBluetooth module directory')
 board_objects = []
-for stem, extra in [('CpuFreqProbe', ()), ('WifiProbe', ('-I', str(WIFI / 'include'))),
+for stem, extra in [('CpuFreqProbe', ()), ('ThermalProbe', ()), ('BoardClock', ()), ('GpuMemoryPool', ()), ('WifiProbe', ('-I', str(WIFI / 'include'))),
                     ('BluetoothProbe', ('-I', str(BLUETOOTH / 'include'), '-I', str(ROOT / 'kits/Sm8550Platform'))),
                     ('AdspProbe', ()), ('AudioProbe', ()),
                     ('BacklightProbe', ()), ('DisplayTimingProbe', ()), ('BatteryProbe', ()), ('KeyboardProbe', ()),
-                    # GPU power, GMU and the Metal accelerator publication (sheng-gpu-power, sheng-gpu-metal), as on iPadOS 17.
+                    # GPU power, GMU and the Metal accelerator publication (gpu-power, gpu-metal), as on iPadOS 17.
                     ('GpuPowerProbe', tuple(x for d in ('drivers/Adreno740', 'kits/ArmSmmu4K', 'kits/AdrenoFirmware', 'kits/AdrenoPM4',
                                                         'kits/Sm8550Platform') for x in ('-I', str(ROOT / d))))]:
     compile_cpp(KITS / (stem + '.cpp'), board_dir / (stem + '.o'), extra)
     board_objects.append(board_dir / (stem + '.o'))
-for stem, extra in [('WifiNet', ('-I', str(WIFI / 'include'))), ('AppleARMBacklight', ()), ('ShengBattery', ()), ('ShengAudioService', ())]:
+for stem, extra in [('WifiNet', ('-I', str(WIFI / 'include'))), ('AppleARMBacklight', ()), ('ShengBattery', ()), ('ShengAudioService', ()), ('ThermalLevel', ())]:
     compile_cpp(KITS / (stem + '.cpp'), board_dir / (stem + '.o'), extra)
     run([llvm / 'llvm-objcopy', '--remove-section=__DATA,__mod_init_func', f'--globalize-symbol=__GLOBAL__sub_I_{stem}.cpp',
          board_dir / (stem + '.o'), board_dir / (stem + '.late.o')])
@@ -532,9 +549,11 @@ keyboard_pin = next(line.split('|', 1)[1].strip() for line in (DEVICE / 'proprie
                     if line.lstrip('-').startswith('nanosic/MCU_Upgrade.bin|'))
 keyboard_bytes = keyboard_firmware.read_bytes()
 require(hashlib.sha256(keyboard_bytes).hexdigest() == keyboard_pin, f'{keyboard_firmware}: not the pinned image')
+# macOS: in __DATA, as the touch image (build-sheng-source-drivers.py).
+keyboard_placement = '__attribute__((section("__DATA,__firmware"))) ' if MACOS else ''
 (board_dir / 'Wn8030Firmware.c').write_text('/* Generated vendor firmware; build output only. */\n#include <stdint.h>\n'
                                             f'const uint32_t native_keyboard_firmware_size = {len(keyboard_bytes)};\n'
-                                            f'const uint8_t native_keyboard_firmware[{len(keyboard_bytes)}] = {{' +
+                                            f'{keyboard_placement}const uint8_t native_keyboard_firmware[{len(keyboard_bytes)}] = {{' +
                                             ','.join(str(b) for b in keyboard_bytes) + '};\n')
 compile_c(board_dir / 'Wn8030Firmware.c', board_dir / 'Wn8030Firmware.o')
 board_objects.append(board_dir / 'Wn8030Firmware.o')
@@ -547,16 +566,18 @@ board_objects += [Path(line.split(' ', 1)[1]) for line in run(['python3', ROOT /
     board_dir / 'qca-bluetooth', '--tree', ROOT], text=True).splitlines() if line.startswith('OBJ ')]
 input_objects += board_objects
 # USB device mode: the native SM8550 subclass of the original AppleUSBXDCI of this fileset.
-usb_abi = json.loads(Path(__file__).resolve().with_name('usb-xdci-24A446.json').read_text())
+usb_abi = json.loads(Path(__file__).resolve().with_name(f'usb-xdci-{BUILD}.json').read_text())
 usb_slots = [(int(t, 16), int(d, 16)) for t, d in usb_abi['slots']]
 usb_methods = {int(k): v for k, v in usb_abi['methods'].items()}
-usb_pure = {i for i, (t, _) in enumerate(usb_slots) if t == slots[214][0]}
+usb_pure = {i for i, (t, _) in enumerate(usb_slots) if t == PURE_TARGET}
 USB = DEVICE / 'drivers/QcomDwc3'
 require((USB / 'QcomDwc3.cpp').exists(), 'QcomDwc3 module directory')
 USB_OUT = board_dir / 'qcom-dwc3'
 USB_OUT.mkdir(parents=True, exist_ok=True)
-usb_names = {179: 'XDCI_KEEP_CONFIGURATIONS', 227: 'XDCI_DESIRED_POWER', 267: 'XDCI_TRANSPORT_ACTIVE', 268: 'XDCI_POWER_ON', 269: 'XDCI_POWER_OFF', 270: 'XDCI_PARAMETERS',
-             275: 'XDCI_CONTROLLER_RESET', 277: 'XDCI_PERIODIC_USAGE', 278: 'XDCI_PERIODIC_SET'}
+usb_names = ({int(k): v for k, v in usb_abi['macros'].items()} if 'macros' in usb_abi else
+             {179: 'XDCI_KEEP_CONFIGURATIONS', 227: 'XDCI_DESIRED_POWER', 267: 'XDCI_TRANSPORT_ACTIVE', 268: 'XDCI_POWER_ON',
+              269: 'XDCI_POWER_OFF', 270: 'XDCI_PARAMETERS', 275: 'XDCI_CONTROLLER_RESET', 277: 'XDCI_PERIODIC_USAGE',
+              278: 'XDCI_PERIODIC_SET'})
 usb_header = '''// Generated from the reviewed AppleUSBXDCI fixture; opaque private storage only.
 #pragma once
 #include <IOKit/IOService.h>
@@ -581,7 +602,7 @@ public:
  IOReturn powerStateWillChangeTo(IOPMPowerFlags,unsigned long,IOService *) override;
  IOReturn powerStateDidChangeTo(IOPMPowerFlags,unsigned long,IOService *) override;
 '''
-for i in range(168, len(usb_slots)):
+for i in range(usb_abi.get('base_slots', 168), len(usb_slots)):
     m = usb_methods[i]
     suffix = '=0' if i in usb_pure else ''
     usb_header += f' virtual {m["returns"]} {m["name"]}({m["parameters"]}){suffix};\n'
@@ -589,10 +610,11 @@ usb_header += f'}};\nstatic_assert(sizeof(AppleUSBXDCI)=={usb_abi["instance_size
 (USB_OUT / 'OriginalUsbXdciABI.h').write_text(usb_header)
 # Host mode: the native subclass of the original AppleUSBXHCI, in the same object. IOService slots the original overrides are declared so
 # that the native vtable reaches them.
-xhci_abi = json.loads(Path(__file__).resolve().with_name('usb-xhci-24A446.json').read_text())
+xhci_abi = json.loads(Path(__file__).resolve().with_name(f'usb-xhci-{BUILD}.json').read_text())
 xhci_slots = [(int(t, 16), int(d, 16)) for t, d in xhci_abi['slots']]
 xhci_methods = {int(k): v for k, v in xhci_abi['methods'].items()}
-xhci_names = {188: 'XHCI_DESIRED_POWER', 315: 'XHCI_READ64', 317: 'XHCI_WRITE64'}
+xhci_names = ({int(k): v for k, v in xhci_abi['macros'].items()} if 'macros' in xhci_abi else
+              {188: 'XHCI_DESIRED_POWER', 315: 'XHCI_READ64', 317: 'XHCI_WRITE64'})
 xhci_header = '''// Generated from the reviewed AppleUSBXHCI fixture; opaque private storage only.
 #pragma once
 #include <IOKit/IOService.h>
@@ -628,7 +650,7 @@ public:
  IOReturn powerStateWillChangeTo(IOPMPowerFlags,unsigned long,IOService *) override;
  IOReturn powerStateDidChangeTo(IOPMPowerFlags,unsigned long,IOService *) override;
 '''
-for i in range(168, len(xhci_slots)):
+for i in range(xhci_abi.get('base_slots', 168), len(xhci_slots)):
     m = xhci_methods[i]
     xhci_header += f' virtual {m["returns"]} {m["name"]}({m["parameters"]});\n'
 xhci_header += f'}};\nstatic_assert(sizeof(AppleUSBXHCI)=={xhci_abi["instance_size"]},"Original controller instance size");\n'
@@ -649,7 +671,7 @@ for i, (name, word) in enumerate(usb_entries):
         require(i not in usb_pure, f'{usb_vt} slot {i} ({name}) implements an abstract original slot')
         require(usb_bindings.setdefault(name, usb_slots[i][0] + slide) == usb_slots[i][0] + slide, f'{name}: one original address')
     elif not name.startswith(('__ZN12QcomDwc3Xdci', '__ZNK12QcomDwc3Xdci')):
-        require(i < 168, f'{usb_vt} slot {i} ({name}) is inherited from IOService')
+        require(i < usb_abi.get('base_slots', 168), f'{usb_vt} slot {i} ({name}) is inherited from IOService')
 usb_slot_by_diversity = {d: i for i, (_, d) in enumerate(usb_slots)}
 for name in sorted({n for n, _, k in usb_found if k == 1 and '12AppleUSBXDCI' in n} - set(usb_bindings)):
     slot = usb_slot_by_diversity.get(discriminator(name[1:]))
@@ -666,9 +688,11 @@ for i, (name, word) in enumerate(xhci_entries):
     if '12AppleUSBXHCI' in name:
         require(xhci_bindings.setdefault(name, xhci_slots[i][0] + slide) == xhci_slots[i][0] + slide, f'{name}: one original address')
     elif not name.startswith(('__ZN12QcomDwc3Xhci', '__ZNK12QcomDwc3Xhci')):
-        require(i < 168, f'{xhci_vt} slot {i} ({name}) is inherited from IOService')
+        require(i < xhci_abi.get('base_slots', 168), f'{xhci_vt} slot {i} ({name}) is inherited from IOService')
 # Targets below the kernel's text are the original's overrides in its kexts.
-xhci_io = {i for i, (t, _) in enumerate(xhci_slots[:168]) if t < 0xfffffe000b000000 and i not in (0, 1, 7)}
+XHCI_BASE = xhci_abi.get('base_slots', 168)
+kernel_text = range(*(int(x, 16) for x in xhci_abi['kernel_text'])) if 'kernel_text' in xhci_abi else range(0xfffffe000b000000, 1 << 64)
+xhci_io = {i for i, (t, _) in enumerate(xhci_slots[:XHCI_BASE]) if t not in kernel_text and i not in (0, 1, 7)}
 for i in sorted(xhci_io):
     require('12AppleUSBXHCI' in xhci_entries[i][0] or 'QcomDwc3Xhci' in xhci_entries[i][0], f'{xhci_vt} slot {i} ({xhci_entries[i][0]}) reaches the original override')
 xhci_slot_by_diversity = {d: i for i, (_, d) in enumerate(xhci_slots)}
@@ -693,7 +717,166 @@ usb_late = USB_OUT / 'QcomDwc3.late.o'
 run([llvm / 'llvm-objcopy', '--remove-section=__DATA,__mod_init_func', '--globalize-symbol=__GLOBAL__sub_I_QcomDwc3.cpp',
      USB_OUT / 'QcomDwc3.o', usb_late])
 input_objects += [usb_late, USB_OUT / 'usb-bindings.o', USB_OUT / 'usb-addresses.o', USB_OUT / 'UsbProbe.o']
+# The VPU: the iris driver's C parts, the SoC's video clock controller and apps SMMU domain, the board platform, the iris decoder as
+# a V4L2 decoder device, and VideoToolbox's paravirtualized codec transport and host over it (the transport's classes registered late).
+IRIS = Path(os.environ.get('QCOM_IRIS_DIR') or DEVICE / 'drivers/QcomIris')
+require((IRIS / 'include/QcomIrisDevice.h').exists() and (IRIS / 'kernel/VtParavirt.cpp').exists(), 'QcomIris module directory')
+IRIS_OUT = board_dir / 'qcom-iris'
+IRIS_OUT.mkdir(parents=True, exist_ok=True)
+input_objects += [Path(line.split(' ', 1)[1]) for line in run(['python3', ROOT / 'scripts/build-qcom-iris.py', IRIS, IRIS_OUT / 'c',
+    '--tree', ROOT], text=True).splitlines() if line.startswith('OBJ ')]
+for stem in ('Sm8550VideoCc', 'Sm8550AppsSmmu'):
+    compile_c(ROOT / 'kits/Sm8550Platform' / (stem + '.c'), IRIS_OUT / (stem + '.o'))
+    input_objects.append(IRIS_OUT / (stem + '.o'))
+iris_flags = ('-I', str(IRIS / 'include'), '-I', str(IRIS / 'kernel'), '-I', str(IRIS / 'shim'),
+              '-I', str(IRIS / 'deps/linux/drivers/media/platform/qcom/iris'), '-I', str(ROOT / 'kits/Sm8550Platform'), '-I', str(ROOT / 'kits/ArmSmmu4K'))
+for src in (KITS / 'VideoProbe.cpp', KITS / 'VideoToolboxProbe.cpp', IRIS / 'kernel/IrisMedia.cpp', IRIS / 'kernel/VtHost.cpp',
+            IRIS / 'kernel/VtParavirt.cpp'):
+    compile_cpp(src, IRIS_OUT / (src.stem + '.o'), iris_flags + ('-Os',))   # native text is short of room
+run([llvm / 'llvm-objcopy', '--remove-section=__DATA,__mod_init_func', '--globalize-symbol=__GLOBAL__sub_I_VtParavirt.cpp',
+     IRIS_OUT / 'VtParavirt.o', IRIS_OUT / 'VtParavirt.late.o'])
+input_objects += [IRIS_OUT / 'VideoProbe.o', IRIS_OUT / 'VideoToolboxProbe.o', IRIS_OUT / 'IrisMedia.o', IRIS_OUT / 'VtHost.o',
+                  IRIS_OUT / 'VtParavirt.late.o']
+print('Video: the iris decoder device and the VideoToolbox host')
 print(f'USB: {len(usb_bindings)} original bindings, {usb_vt} and {xhci_vt} match the original diversities')
+# macOS: the board's Ethernet controller en0 (ShengEthernet.cpp), an IOEthernetController of the original IONetworkingFamily compiled with
+# the macOS SDK's public family headers (after the kernel's own, so only IOKit/network comes from there). Its vtable must be the
+# collection's slot for slot (net-ether-<build>.json): every entry signed with the original diversity, every inherited entry bound to
+# the original target, every family import bound to the collection's symbol.
+if MACOS:
+    ETH_OUT = board_dir / 'ethernet'
+    ETH_OUT.mkdir(parents=True, exist_ok=True)
+    eth_abi = json.loads(Path(__file__).resolve().with_name(f'net-ether-{BUILD}.json').read_text())
+    require(eth_abi['kernelcache_sha256'] == abi['kernelcache_sha256'], 'Ethernet fixture of the same collection')
+    macsdk = run(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], text=True).strip()
+    # The SDK declares IONetworkController's reserved slots 2-5 unused; the shipped family uses them (outputStart,
+    # setInputPacketPollingEnable, pollInputPackets, networkInterfaceNotification). Apple's published IONetworkingFamily headers
+    # declare them under __PRIVATE_SPI__, so those headers, as IOKit/network, come first.
+    ionet = ROOT / '.cache/IONetworkingFamily-188'
+    if not (ionet / 'IONetworkController.h').is_file():
+        subprocess.run(['git', 'clone', '-q', '--depth', '1', '--branch', 'IONetworkingFamily-188',
+                        'https://github.com/apple-oss-distributions/IONetworkingFamily.git', str(ionet)], check=True)
+    ionet_include = ETH_OUT / 'include/IOKit'
+    ionet_include.mkdir(parents=True, exist_ok=True)
+    if not (ionet_include / 'network').exists():
+        (ionet_include / 'network').symlink_to(ionet)
+    # The family's instance sizes as the collection has them: the source asserts the SDK headers give the same.
+    compile_cpp(KITS / 'ShengEthernet.cpp', ETH_OUT / 'ShengEthernet.o',
+                ('-I', str(ETH_OUT / 'include'), '-idirafter', f'{macsdk}/System/Library/Frameworks/Kernel.framework/Headers',
+                 f'-DSHENG_ETHERNET_CONTROLLER_SIZE={eth_abi["instance_size"]}',
+                 f'-DSHENG_ETHERNET_INTERFACE_SIZE={eth_abi["interface_instance_size"]}'))
+    eth_raw = (ETH_OUT / 'ShengEthernet.o').read_bytes()
+    eth_found = object_symbols(eth_raw)
+    eth_pure = int(eth_abi['pure_target'], 16)
+    eth_bindings = {n: int(v, 16) + slide for n, v in eth_abi['bindings'].items()}
+    family = tuple(f'{len(c)}{c}' for c in ('IONetworkController', 'IOEthernetController', 'IONetworkMedium', 'IONetworkInterface',
+                                           'IOEthernetInterface', 'IOOutputQueue'))
+    eth_used = {n for n, _, k in eth_found if k == 1 and any(c in n for c in family)}
+
+    def family_vtable(cls, base, slots):
+        """Check the vtable of cls, a subclass of the family's class base, against base's slots in the collection; the slots cls overrides."""
+        vt = f'__ZTV{len(cls)}{cls}'
+        own = (f'__ZN{len(cls)}{cls}', f'__ZNK{len(cls)}{cls}')
+        entries = object_vtable(eth_raw, eth_found, vt, len(slots) + 1)
+        require(all(entries[:len(slots)]) and not entries[len(slots)], f'{vt}: exactly the {len(slots)} {base} entries')
+        override_slot = {}
+        for i, (name, word) in enumerate(entries[:len(slots)]):
+            require(word >> 63 and word >> 48 & 1 and word >> 49 & 3 == 0 and (word >> 32) & 0xffff == slots[i][1],
+                    f'{vt} slot {i} ({name}) signed with the original diversity {slots[i][1]:#x}')
+            if name.startswith(own):
+                override_slot[name[len(own[0]) if name.startswith(own[0]) else len(own[1]):]] = i
+            elif any(c in name for c in family):
+                require(slots[i][0] != eth_pure, f'{vt} slot {i}: the abstract original slot is implemented')
+                require(eth_bindings.setdefault(name, slots[i][0] + slide) == slots[i][0] + slide,
+                        f'{vt} slot {i} ({name}) is the original entry')
+            else:
+                # The kernel's own classes (OSObject, IOService): the kernel defines these, the link resolves them.
+                require(i < BASE, f'{vt} slot {i} ({name}) is a kernel method within the IOService slots')
+        for name in sorted(eth_used - set(eth_bindings)):
+            # A qualified call of a base method the family class does not override itself (IOEthernetController::start is
+            # IONetworkController's): the original entry of the slot this class overrides with the same method.
+            tail = next((name[len(q):] for q in (f'__ZN{len(base)}{base}', f'__ZNK{len(base)}{base}') if name.startswith(q)), None)
+            if tail in override_slot:
+                eth_bindings[name] = slots[override_slot[tail]][0] + slide
+        eth_used.update(e[0] for e in entries[:len(slots)] if not e[0].startswith(own) and any(c in e[0] for c in family))
+        return vt
+
+    eth_slots = [(int(t, 16), int(d, 16)) for t, d in eth_abi['slots']]
+    interface_slots = [(int(t, 16), int(d, 16)) for t, d in eth_abi['interface_slots']]
+    eth_vt = family_vtable('ShengEthernet', 'IOEthernetController', eth_slots)
+    interface_vt = family_vtable('ShengWifiInterface', 'IOEthernetInterface', interface_slots)
+    for name in sorted(eth_used - set(eth_bindings)):
+        require(False, f'{name}: bound to the collection')
+    eth_text, eth_addresses = '.text\n.p2align 2\n', ''
+    for name in sorted(eth_used):
+        va = eth_bindings[name]
+        if name.endswith('10gMetaClassE') or name.startswith('__ZTV'):
+            eth_addresses += f'.globl {name}\n.set {name}, {va:#x}\n'
+        else:
+            eth_addresses += f'.globl {name}.original\n.set {name}.original, {va:#x}\n'
+            eth_text += f'.globl {name}\n{name}:\n bti c\n b {name}.original\n'
+    (ETH_OUT / 'eth-bindings.S').write_text(eth_text)
+    (ETH_OUT / 'eth-addresses.S').write_text(eth_addresses)
+    for stem in ('eth-bindings', 'eth-addresses'):
+        run(['xcrun', 'clang', '-target', TRIPLE, '-isysroot', sdk, '-c', ETH_OUT / (stem + '.S'), '-o', ETH_OUT / (stem + '.o')])
+    eth_late = ETH_OUT / 'ShengEthernet.late.o'
+    run([llvm / 'llvm-objcopy', '--remove-section=__DATA,__mod_init_func', '--globalize-symbol=__GLOBAL__sub_I_ShengEthernet.cpp',
+         ETH_OUT / 'ShengEthernet.o', eth_late])
+    input_objects += [eth_late, ETH_OUT / 'eth-bindings.o', ETH_OUT / 'eth-addresses.o']
+    print(f'Ethernet: {len(eth_used)} original bindings, {eth_vt} matches the original {len(eth_slots)} diversities, '
+          f'{interface_vt} the {len(interface_slots)} of IOEthernetInterface')
+# macOS: the software AES-CBC provider (UniXNU drivers/SoftwareAES, NativeAES.cpp), an IOAESAccelerator of the original
+# IOCryptoAcceleratorFamily. AppleImage4's start waits for an IOAESAccelerator service without a limit (kmod_expert_finalize), holding its
+# expert lock; this board has no AES engine. Its vtable must be the collection's slot for slot (software-aes-<build>.json), as Ethernet's.
+if MACOS:
+    AES_OUT = board_dir / 'software-aes'
+    AES_OUT.mkdir(parents=True, exist_ok=True)
+    aes_abi = json.loads(Path(__file__).resolve().with_name(f'software-aes-{BUILD}.json').read_text())
+    require(aes_abi['kernelcache_sha256'] == abi['kernelcache_sha256'], 'AES fixture of the same collection')
+    require(int(aes_abi['instance_size'], 16) == 0x120, 'IOAESAccelerator instance size of OriginalAESABI.h')
+    compile_cpp(ROOT / 'drivers/SoftwareAES/NativeAES.cpp', AES_OUT / 'NativeAES.o', ('-DNATIVE_AES_DARWIN26=1',))
+    aes_raw = (AES_OUT / 'NativeAES.o').read_bytes()
+    aes_found = object_symbols(aes_raw)
+    aes_slots = [(int(t, 16), int(d, 16)) for t, d in aes_abi['slots']]
+    aes_pure = int(aes_abi['pure_target'], 16)
+    aes_bindings = {n: int(v, 16) + slide for n, v in aes_abi['bindings'].items()}
+    aes_vt = '__ZTV9NativeAES'
+    aes_family = ('19IOCryptoAccelerator', '16IOAESAccelerator')
+    aes_entries = object_vtable(aes_raw, aes_found, aes_vt, len(aes_slots) + 1)
+    require(all(aes_entries[:len(aes_slots)]) and not aes_entries[len(aes_slots)], f'{aes_vt}: exactly the {len(aes_slots)} IOAESAccelerator entries')
+    aes_own = ('__ZN9NativeAES', '__ZNK9NativeAES')
+    for i, (name, word) in enumerate(aes_entries[:len(aes_slots)]):
+        require(word >> 63 and word >> 48 & 1 and word >> 49 & 3 == 0 and (word >> 32) & 0xffff == aes_slots[i][1],
+                f'{aes_vt} slot {i} ({name}) signed with the original diversity {aes_slots[i][1]:#x}')
+        if name.startswith(aes_own):
+            continue
+        if any(c in name for c in aes_family):
+            require(aes_slots[i][0] != aes_pure, f'{aes_vt} slot {i}: the abstract original slot is implemented')
+            require(aes_bindings.setdefault(name, aes_slots[i][0] + slide) == aes_slots[i][0] + slide,
+                    f'{aes_vt} slot {i} ({name}) is the original entry')
+        else:
+            require(i < BASE, f'{aes_vt} slot {i} ({name}) is a kernel method within the IOService slots')
+    aes_used = {n for n, _, k in aes_found if k == 1 and any(c in n for c in aes_family)}
+    require(not (aes_used - set(aes_bindings)), f'AES imports bound to the collection: {sorted(aes_used - set(aes_bindings))}')
+    aes_used |= {e[0] for e in aes_entries[:len(aes_slots)] if not e[0].startswith(aes_own) and any(c in e[0] for c in aes_family)}
+    aes_text, aes_addresses = '.text\n.p2align 2\n', ''
+    for name in sorted(aes_used):
+        va = aes_bindings[name]
+        if name.endswith('10gMetaClassE') or name.startswith('__ZTV'):
+            aes_addresses += f'.globl {name}\n.set {name}, {va:#x}\n'
+        else:
+            aes_addresses += f'.globl {name}.original\n.set {name}.original, {va:#x}\n'
+            aes_text += f'.globl {name}\n{name}:\n bti c\n b {name}.original\n'
+    (AES_OUT / 'aes-bindings.S').write_text(aes_text)
+    (AES_OUT / 'aes-addresses.S').write_text(aes_addresses)
+    for stem in ('aes-bindings', 'aes-addresses'):
+        run(['xcrun', 'clang', '-target', TRIPLE, '-isysroot', sdk, '-c', AES_OUT / (stem + '.S'), '-o', AES_OUT / (stem + '.o')])
+    aes_late = AES_OUT / 'NativeAES.late.o'
+    run([llvm / 'llvm-objcopy', '--remove-section=__DATA,__mod_init_func', '--globalize-symbol=__GLOBAL__sub_I_NativeAES.cpp',
+         AES_OUT / 'NativeAES.o', aes_late])
+    compile_cpp(KITS / 'SoftwareAesProbe.cpp', AES_OUT / 'SoftwareAesProbe.o', ())
+    input_objects += [aes_late, AES_OUT / 'aes-bindings.o', AES_OUT / 'aes-addresses.o', AES_OUT / 'SoftwareAesProbe.o']
+    print(f'AES: {len(aes_used)} original bindings, {aes_vt} matches the original {len(aes_slots)} diversities')
 print(f'Board drivers: {len(board_objects)} objects')
 archive = OUT / 'libNativeLegacyDisplay.late.a'
 archive.unlink(missing_ok=True)
@@ -703,17 +886,22 @@ sources = [ROOT / 'drivers/GopFramebuffer/NativeLegacyDisplay.cpp', ROOT / 'driv
            ROOT / 'drivers/GopFramebuffer/NativeGOPPresenter.cpp', ROOT / 'drivers/GopFramebuffer/NativeGOPWire.h',
            ROOT / 'drivers/GopFramebuffer/NativeHalfCodes.h', source,
            ROOT / 'scripts' / ABI_PATH.name, keystore_source, ROOT / 'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp',
-           ROOT / 'scripts/hid-device-24A446.json', hid_probe]
+           ROOT / f'scripts/hid-device-{BUILD}.json', hid_probe]
 sources += [KITS / name for name in ('BluetoothProbe.cpp', 'BluetoothFirmware.h', 'WcnPower.h')]
 sources += [ROOT / 'scripts/build-qca-bluetooth.py', BLUETOOTH / 'tools/source-lock.json']
 sources += [Path(name) for name in json.loads((board_dir / 'qca-bluetooth/report.json').read_text())['source']]
 for directory in ('include', 'src', 'shim', 'out/linux'):
     sources += sorted((BLUETOOTH / directory).rglob('*.h'))
 sources += [ROOT / 'kits/Sm8550Platform' / name for name in ('Sm8550GeniUart.h', 'Sm8550QupDma.h')]
+sources += [KITS / 'VideoProbe.cpp', KITS / 'VideoToolboxProbe.cpp', ROOT / 'scripts/build-qcom-iris.py', IRIS / 'tools/source-lock.json',
+            ROOT / 'kits/Sm8550Platform/Sm8550VideoCc.c', ROOT / 'kits/Sm8550Platform/Sm8550AppsSmmu.c']
+sources += [Path(name) for name in json.loads((IRIS_OUT / 'c/report.json').read_text())['source']]
+for directory in ('include', 'kernel', 'src', 'shim'):
+    sources += sorted((IRIS / directory).rglob('*.h')) + sorted((IRIS / directory).glob('*.cpp'))
 sources += [KITS / name for name in ('SmmuBypass.h', 'AppsSmmuLock.h', 'UsbProbe.cpp')]
 sources += [KITS / name for name in ('KeyboardCover.cpp', 'KeyboardProbe.cpp', 'Wn8030.c', 'Wn8030.h', 'GeniI2c.c', 'GeniI2c.h')]
 sources += [keyboard_firmware]
-sources += [USB / 'QcomDwc3.cpp', USB / 'QcomEusb2Phy.h', USB / 'QcomQmpUsb3.h', USB / 'QcomUcsi.h', ROOT / 'scripts/usb-xdci-24A446.json', ROOT / 'scripts/usb-xhci-24A446.json']
+sources += [USB / 'QcomDwc3.cpp', USB / 'QcomEusb2Phy.h', USB / 'QcomQmpUsb3.h', USB / 'QcomUcsi.h', ROOT / f'scripts/usb-xdci-{BUILD}.json', ROOT / f'scripts/usb-xhci-{BUILD}.json']
 
 
 def source_name(path):
@@ -728,4 +916,4 @@ def source_name(path):
     kernelcache_sha256=abi['kernelcache_sha256'], compiled_object_sha256=sha(obj), archive_sha256=sha(archive),
     bindings={n: hex(v) for n, v in bindings.items()}, virtual_entries=len(slots), owned_entries=owned,
     inherited_native_entries=native, original_bindings='fixed-collection-addresses', original_instructions_modified=False), indent=2) + '\n')
-print(f'Built the owned Legacy backend on the iPadOS 27 class: {len(owned)} owned, {len(native)} native, {len(bindings)} original bindings')
+print(f'Built the owned Legacy backend on the {BUILD} class: {len(owned)} owned, {len(native)} native, {len(bindings)} original bindings')

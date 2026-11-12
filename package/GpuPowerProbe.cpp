@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 #include "BootLatencyTrace.h"
-// Default-off, staged read-only observation of the Adreno power and clock state. `sheng-gpu-power=<n>`:
+// Default-off, staged read-only observation of the Adreno power and clock state. `gpu-power=<n>`:
 //   1  read GCC GPU branches, GPUCC gdscr/branches, GPU SMMU global space 0 and RBBM_STATUS, each only when the previous stage
 //      showed its prerequisite on (GpuPowerBoard.h); no register is written
 //   2  as 1, plus the one write Linux's gcc-sm8550 probe makes: enable gcc_gpu_cfg_ahb_clk if its enable bit is clear
@@ -156,7 +156,7 @@ volatile uint32_t native_gpu_power_stage;
 namespace {
 unsigned mode() {
     static unsigned cached = ~0u;
-    if (cached == ~0u) {unsigned m = 0; PE_parse_boot_argn("sheng-gpu-power", &m, sizeof m); cached = m > 9 ? 9 : m;}
+    if (cached == ~0u) {unsigned m = 0; PE_parse_boot_argn("gpu-power", &m, sizeof m); cached = m > 9 ? 9 : m;}
     return cached;
 }
 void delayUs(void *, unsigned us) {IODelay(us);}
@@ -189,7 +189,17 @@ int wr(void *, unsigned w, uint32_t off, uint32_t value) {
     __asm__ volatile("dsb sy" ::: "memory");
     return 0;
 }
+// Every row the probe ever set, in order (the eight shown rows are shared and overwritten): the first 40, each "<slot> <text>".
+extern "C" {volatile char native_gpu_row_log[40][52]; volatile uint32_t native_gpu_row_count;}
 void setRow(unsigned slot, const char *text) {
+    const uint32_t n = __atomic_fetch_add(&native_gpu_row_count, 1, __ATOMIC_RELAXED);
+    if (n < 40) {
+        char *line = const_cast<char *>(native_gpu_row_log[n]);
+        line[0] = static_cast<char>('0' + (slot & 7)); line[1] = ' ';
+        unsigned k = 0;
+        for (; k < 48 && text[k]; ++k) line[2 + k] = text[k];
+        line[2 + k] = 0;
+    }
     unsigned i = 0;
     for (; i < 47 && text[i]; ++i) boot_progress_ext[slot][i] = text[i];
     for (; i < 47; ++i) boot_progress_ext[slot][i] = ' ';
@@ -377,13 +387,14 @@ int preemptWrite(void *, uint32_t reg, uint32_t value) {
 // The CP's preemption, as the board sees it: [0] set up (0 yes), [1] CP_SW interrupts seen, [2] the last such RBBM_INT_0_STATUS word.
 extern "C" {volatile uint32_t native_gpu_preempt[8];}
 extern "C" bool native_adreno_preempt_irq() __attribute__((weak));   // NativeAdrenoPublish.cpp
+extern "C" void native_adreno_gpu_interrupt(uint32_t status) __attribute__((weak));   // NativeAdrenoPublish.cpp: asks for the completion pass
 // The ring, memptrs and lists are Normal non-cacheable on both sides (GPU PTE MAIR 0, CPU write-combine): no cache
 // maintenance, only ordering.
 int ringPublish(void *, const volatile uint32_t *, size_t) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
 int ringAcquire(void *, volatile uint32_t *, size_t) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
 uint64_t ringNow(void *) {uint64_t us = 0; coldNow(nullptr, &us); return us;}
 // The fence waits' pause. Once the GPU line is attached (irqAndTimer) a waiter that may block sleeps until the next GPU interrupt or
-// `sheng-gpu-pause-us=<us>` (default 1000), whichever is first; before that, or where it may not block, it spins 20 us. int-143's
+// `gpu-pause-us=<us>` (default 1000), whichever is first; before that, or where it may not block, it spins 20 us. int-143's
 // waiters spun through every frame's GPU time (35 ms a commit) on CPUs that were already the bottleneck. Every fence is a
 // CACHE_FLUSH_TS with its interrupt bit (unmasked in RBBM_INT_0_MASK), so the interrupt ends the sleep; i566's 100 us cap woke the
 // waiters 274105 times in 318 s, a context switch each, on cores that could otherwise idle.
@@ -407,10 +418,10 @@ OSSharedPtr<IOMemoryMap> gGpuMaps[GpuBufferCount];
 volatile uint8_t *gGpuCpu[GpuBufferCount];
 NativeAdrenoGpuBuffer gGpuBuffers[GpuBufferCount];
 NativeAdrenoRing gRing;
-NativeAdrenoRing gRing1;   // the second ring of the CP's preemption (sheng-gpu-preempt=1)
+NativeAdrenoRing gRing1;   // the second ring of the CP's preemption (gpu-preempt=1)
 bool gTimelineWanted = false;
 bool gPreemptWanted;
-unsigned gPreemptMode = 1;   // sheng-gpu-preempt=1: only the low and disabled queues take the second ring; =2: the normal ones too
+unsigned gPreemptMode = 1;   // gpu-preempt=1: only the low and disabled queues take the second ring; =2: the normal ones too
 NativeAdrenoCpInit gCpInit;
 extern "C" {
 NativeAdrenoGmuContextReport native_gpu_context;
@@ -459,9 +470,10 @@ bool physRead64(uint64_t pa, uint64_t *out) {
 // NativeAdrenoVm::sampleWord's cached reader: one aligned word through the kernel's cacheable physical aperture, so a line a client's
 // cacheable view left dirty is seen whatever the cache mode of the BO's own mappings.
 extern "C" vm_offset_t phystokv(uint64_t pa);
-extern "C" uint64_t gPhysBase, gPhysSize;
+// Memory the kernel manages and phystokv covers: its own range, and DRAM outside it that it adopted.
+extern "C" boolean_t pmap_valid_address(uint64_t pa);
 int cachedRead32(uint64_t pa, uint32_t *value) {
-    if ((pa & 3) || pa < gPhysBase || pa - gPhysBase >= gPhysSize) return 1;
+    if ((pa & 3) || !pmap_valid_address(pa)) return 1;
     const vm_offset_t va = phystokv(pa);
     if (!va) return 1;
     *value = *reinterpret_cast<volatile uint32_t *>(va);
@@ -476,7 +488,7 @@ int cachedRead32(uint64_t pa, uint32_t *value) {
 extern "C" unsigned int pmap_cache_attributes(unsigned int pn);
 extern "C" {volatile uint64_t native_adreno_audit_ticks; volatile uint32_t native_adreno_audit_attr;}
 int lineAudit(uint64_t pa, size_t bytes, uint32_t *dirty, uint32_t *stale) {
-    if (!bytes || ((pa | bytes) & 63) || (pa & 0xfff) + bytes > 0x1000 || pa < gPhysBase || pa - gPhysBase >= gPhysSize) return 1;
+    if (!bytes || ((pa | bytes) & 63) || (pa & 0xfff) + bytes > 0x1000 || !pmap_valid_address(pa)) return 1;
     const uint64_t began = mach_absolute_time();
     const vm_offset_t page = ml_io_map_unmappable(vm_offset_t(pa & ~uint64_t(0xfff)), 0x1000, 0x7 /* VM_WIMG_IO */);
     const vm_offset_t cached = phystokv(pa);
@@ -585,10 +597,10 @@ extern unsigned int vm_page_free_count __attribute__((weak));
 uint32_t rd32le(const uint8_t *p) {return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;}
 uint16_t rd16le(const uint8_t *p) {return uint16_t(p[0] | p[1] << 8);}
 unsigned zapLimit() {
-    // sheng-gpu-zap: 0 off, 1 through init_image, 2 through mem_setup and the segment copy, 3 through auth_and_reset,
+    // gpu-zap: 0 off, 1 through init_image, 2 through mem_setup and the segment copy, 3 through auth_and_reset,
     // 4 (default) also CP_SET_SECURE_MODE 0. int-019 (0) reached the desktop and int-017 (4) did not.
     unsigned zap = 4;
-    PE_parse_boot_argn("sheng-gpu-zap", &zap, sizeof zap);
+    PE_parse_boot_argn("gpu-zap", &zap, sizeof zap);
     return zap;
 }
 void zapRow() {
@@ -722,6 +734,9 @@ void gpuIrq(void *) {
         // wake a waiter and use the interrupted thread's turnstile state.
         if (gPreemptCall) thread_call_enter(gPreemptCall);
     }
+    // The driver's completion pass retires finished jobs and wakes the waiters whose fence the CP wrote (bit 20) or whose ring
+    // switch ended (bit 8). The wakeup below serves this file's own waits and the driver's timed pause (gpu-fence-wake=0).
+    if (native_adreno_gpu_interrupt) native_adreno_gpu_interrupt(status);
     thread_wakeup(event_t(&gIrqCount));
 }
 bool cpFence(const uint32_t *words, size_t count) {
@@ -1129,7 +1144,7 @@ int wrapperRound(IOService *svc, int &ok, int &n, IOReturn &err, int &errAt, uin
     uc->release();
     return matched;
 }
-// IO coherence (sheng-gpu-coherent, default 1), before any client: the A740 is ADRENO_QUIRK_HAS_CACHED_COHERENT behind the
+// IO coherence (gpu-coherent, default 1), before any client: the A740 is ADRENO_QUIRK_HAS_CACHED_COHERENT behind the
 // dma-coherent GPU SMMU (a6xx_catalog.c, sm8550.dtsi), and Linux maps its cached BOs with IOMMU_CACHE (write-back, inner shareable).
 // A page of kernel memory is imported and mapped that way, and both directions are proved against DRAM:
 //   read:  the CPU stores new values over lines DRAM still holds old (counted dirty through an uncached mapping), the GPU copies the
@@ -1213,7 +1228,7 @@ static bool walkProbe(NativeAdrenoVm *vm) {
 void coherenceProbe(NativeAdrenoVm *vm) {
     uint32_t *k = native_gpu_coherence;
     unsigned wanted = 1;
-    PE_parse_boot_argn("sheng-gpu-coherent", &wanted, sizeof wanted);
+    PE_parse_boot_argn("gpu-coherent", &wanted, sizeof wanted);
     if (!wanted || !vm || !&native_adreno_io_coherent) {
         snprintf(native_gpu_coherence_row, sizeof native_gpu_coherence_row, "H skip (arg %u vm %d)", wanted, vm != nullptr);
         return;
@@ -1277,9 +1292,9 @@ void coherenceProbe(NativeAdrenoVm *vm) {
     if (buf) IOFreeAligned(buf, kBytes);
     k[7] = pass;
     native_adreno_io_coherent = pass ? 1 : 0;
-    // The walk proof needs the data path proved (it reads the copy through it); sheng-gpu-walk=0 keeps every table page cleaned.
+    // The walk proof needs the data path proved (it reads the copy through it); gpu-walk=0 keeps every table page cleaned.
     unsigned walk = 1;
-    PE_parse_boot_argn("sheng-gpu-walk", &walk, sizeof walk);
+    PE_parse_boot_argn("gpu-walk", &walk, sizeof walk);
     native_adreno_walk_coherent[0] = pass && walk && walkProbe(vm) ? 1 : 0;
     snprintf(native_gpu_coherence_row, sizeof native_gpu_coherence_row, "H d%u/64 a%u r%u/%u w%u/%u s%x k%u -> %s", k[1], gCoherenceAttempts,
              k[2], k[3], k[4], k[5], k[6], k[0], pass ? "on" : "off");
@@ -1323,7 +1338,7 @@ void publishAndWrapperTest(bool rounds) {
     native_adreno_line_audit = lineAudit;
     coherenceProbe(vm);
     const IOReturn timer = gTimer.attach(&gTimerIo, NativeAdrenoTimeCp);
-    {unsigned wc = 1; PE_parse_boot_argn("sheng-gpu-wc", &wc, sizeof wc); native_adreno_wc_enabled = wc ? 1 : 0;}
+    {unsigned wc = 1; PE_parse_boot_argn("gpu-wc", &wc, sizeof wc); native_adreno_wc_enabled = wc ? 1 : 0;}
     openCpAperture();
     const unsigned ias = NativeAdrenoGpuContextInputBits ? NativeAdrenoGpuContextInputBits() : 0;
     gDeviceInfo.va_size = ias > 32 ? (1ull << ias) - GpuClientVaStart : 0;
@@ -1343,8 +1358,8 @@ void publishAndWrapperTest(bool rounds) {
              memStatus, opened, closed, gpuFsr());
     setRow(5, rounds ? row : "P published (rounds skipped)");
 }
-// sheng-gpu-metal=1 publishes the Adreno accelerator for the original Metal discovery (the plugin bundle itself arrives through the
-// boot-time addon mount, sheng-gpu-addon=1, and the trust cache). sheng-gpu-selftest=1 runs the kernel-driven user-client tests that
+// gpu-metal=1 publishes the Adreno accelerator for the original Metal discovery (the plugin bundle itself arrives through the
+// boot-time addon mount, gpu-addon=1, and the trust cache). gpu-selftest=1 runs the kernel-driven user-client tests that
 // int-024..031 already qualified, which frees the diagnostic rows for the plugin's own result.
 unsigned bootArg(const char *name, unsigned fallback) {
     unsigned value = fallback;
@@ -1360,9 +1375,17 @@ void publishMetal() {
         gMetalStatus = kIOReturnUnsupported;
         return;
     }
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+    // macOS: Metal finds accelerators by IOServiceMatching("IOAccelerator"); the base class is IOGraphicsFamily's IOAccelerator
+    // (drivers/AdrenoMetal/OriginalAcceleratorABI.h, the same 136 bytes without operational overrides).
+    gMetalKext = OSKextLoadKextWithIdentifier("com.apple.iokit.IOGraphicsFamily");
+    if (gMetalKext) {gMetalStatus = gMetalKext; return;}
+    const OSSymbol *name = OSSymbol::withCString("IOAccelerator");
+#else
     gMetalKext = OSKextLoadKextWithIdentifier("com.apple.iokit.IOGPUFamily");
     if (gMetalKext) {gMetalStatus = gMetalKext; return;}
     const OSSymbol *name = OSSymbol::withCString("IOAcceleratorES");
+#endif
     const OSMetaClass *parent = name ? OSMetaClass::getMetaClassWithName(name) : nullptr;
     OSSafeReleaseNULL(name);
     if (!parent || parent->getClassSize() != 136) {gMetalStatus = kIOReturnNotFound; return;}
@@ -1669,7 +1692,7 @@ void gpuStart() {
     // 1. The GPU's own context bank and buffers (arm-smmu-qcom: the GPU always gets bank 0; DT iommus SIDs 0 and 1).
     NativeAdrenoGmuContextReport &q = native_gpu_context;
     // Before the bring-up: owned BOs on the IO-coherent path are not write-combined (the mode applies once the coherence proof passes).
-    {unsigned owned = 0; PE_parse_boot_argn("sheng-gpu-owned-coherent", &owned, sizeof owned); native_adreno_owned_coherent = owned ? 1 : 0;}
+    {unsigned owned = 0; PE_parse_boot_argn("gpu-owned-coherent", &owned, sizeof owned); native_adreno_owned_coherent = owned ? 1 : 0;}
     const IOReturn ctx = NativeAdrenoGpuContextBringup(reinterpret_cast<volatile uint8_t *>(gSmmuMap->getVirtualAddress()),
         kSmmuWindow, 0, 2, 0, 0, 1, 1, gpuCtxProgress, &q);
     // Q s<step> st<IOReturn> k<program>/<attach kit status> p<phase>e<enabled> r<route phase>v<verified> n<spans>
@@ -1708,15 +1731,15 @@ void gpuStart() {
     const IOReturn attached = gRing.attach(&rio, &cache, const_cast<uint8_t *>(gGpuCpu[1]), gGpuBuffers[1].bytes,
         gGpuBuffers[1].iova, const_cast<uint8_t *>(gGpuCpu[2]), gGpuBuffers[2].bytes, gGpuBuffers[2].iova);
     if (attached) {snprintf(row, sizeof row, "C4 ring attach %x", unsigned(attached)); setRow(7, row); return;}
-    // The CP counter stamps around each job's buffers and the jobs' timeline are diagnostics (sheng-diag=1; the board's ring is this one,
-    // not the service's); sheng-gpu-timeline=0 or 1 overrides the stamps.
-    {unsigned timeline = 0, diag = 0; PE_parse_boot_argn("sheng-diag", &diag, sizeof diag); native_adreno_diag = diag == 1;
-     if (!PE_parse_boot_argn("sheng-gpu-timeline", &timeline, sizeof timeline)) timeline = diag == 1;
+    // The CP counter stamps around each job's buffers and the jobs' timeline are diagnostics (diag=1; the board's ring is this one,
+    // not the service's); gpu-timeline=0 or 1 overrides the stamps.
+    {unsigned timeline = 0, diag = 0; PE_parse_boot_argn("diag", &diag, sizeof diag); native_adreno_diag = diag == 1;
+     if (!PE_parse_boot_argn("gpu-timeline", &timeline, sizeof timeline)) timeline = diag == 1;
      gRing.setTimeline(timeline != 0); gTimelineWanted = timeline != 0;}
     gpuWr64(A740_CP_BV_RB_RPTR_ADDR, gGpuBuffers[2].iova + 8);   // rbmemptr(bv_rptr)
     // Normal/low work uses ring 1; requested high priorities use ring 0.
     // Boot overrides: 0 one ring, 1 only low/background on ring 1, 2 normal work too.
-    {unsigned preempt = 2; PE_parse_boot_argn("sheng-gpu-preempt", &preempt, sizeof preempt); gPreemptWanted = preempt == 1 || preempt == 2; gPreemptMode = preempt == 2 ? 2 : 1;}
+    {unsigned preempt = 2; PE_parse_boot_argn("gpu-preempt", &preempt, sizeof preempt); gPreemptWanted = preempt == 1 || preempt == 2; gPreemptMode = preempt == 2 ? 2 : 1;}
     if (gPreemptWanted) {
         const IOReturn second = gRing1.attachSecondary(&rio, &cache, const_cast<uint8_t *>(gGpuCpu[9]), gGpuBuffers[9].bytes,
             gGpuBuffers[9].iova, const_cast<uint8_t *>(gGpuCpu[10]), gGpuBuffers[10].bytes, gGpuBuffers[10].iova);
@@ -1759,7 +1782,7 @@ void gpuStart() {
     c[0] = c[6] ? 8 : (c[7] == 0x5e9a740 ? 10 : 9);
     // C10 = the GPU wrote the scratch word through its own 4K context and signalled the fence.
     cpRow(c[0] == 10 ? "ok" : c[6] ? "wto" : "wmiss");
-    // sheng-gpu-zap=0 skips the zap/secure-mode step (int-019 bisect: int-017 stalled userspace at the logo, int-018 with
+    // gpu-zap=0 skips the zap/secure-mode step (int-019 bisect: int-017 stalled userspace at the logo, int-018 with
     // the probe off reached the desktop). The CP then stays in secure mode, as in int-016.
     if (c[0] == 10) {
         setRow(6, "S zap");
@@ -1768,37 +1791,53 @@ void gpuStart() {
         startHeartbeatThread();
         setRow(6, "S irq");
         irqAndTimer();
-        const bool selftest = bootArg("sheng-gpu-selftest", 0) != 0;
+        const bool selftest = bootArg("gpu-selftest", 0) != 0;
         if (selftest) userClientTest();
         setRow(5, "P start");
         if (native_adreno_set_restart) native_adreno_set_restart(gpuRestart, nullptr);
         publishAndWrapperTest(selftest);
-        if (bootArg("sheng-gpu-metal", 0) == 1) publishMetal();
-        if (bootArg("sheng-gpu-dcvs", 0)) startGpuDcvs();
+        if (bootArg("gpu-metal", 0) == 1) publishMetal();
+        if (bootArg("gpu-dcvs", 0)) startGpuDcvs();
     }
 }
-// GPU frequency governor (`sheng-gpu-dcvs=1`, after the Metal service is published): the GMU's XO power counter 0 counts 19.2 MHz
+// GPU frequency governor (`gpu-dcvs=1`, after the Metal service is published): the GMU's XO power counter 0 counts 19.2 MHz
 // ticks while the GPU is busy (a6xx_gpu.c hw_init: GPU_GMU_AO_GPU_CX_BUSY_MASK 0xff000000, countable 5 on counter 0, enable). Every
-// 16 ms it takes the frequency that would have kept that window 50 % busy (msm_gpu_devfreq's upthreshold 50) and goes up at once to
-// the lowest level at or above 1.1 x of it, to the top after a window over 85 % busy or 50 ms busy without a break; it goes down one
-// level after 4 windows in a row (5 right after a step up) that would have needed at most 0.8 x the next lower level, and back to the
-// floor after 80 ms without work. `sheng-gpu-dcvs-min` is the floor level (default 3, 348 MHz). Each change is the same HFI
-// GX_BW_PERF_VOTE as the boot vote, with that level's bandwidth. OPP MHz in sheng-gmu's table order.
-// Two boosts, because the first frames of an animation are the ones a window-based governor serves at the floor (i560: the frames of an
-// app launch took 30-36 ms to finish at 348 MHz, the 10 s windows around them 348 MHz 94-100 % of the time): work after the idle drop
-// starts at the lowest level at or above max(2 x now, 578 MHz) for 50 ms, and a touch report holds the top level until
-// `sheng-gpu-dcvs-boost-ms` (default 1000, 0 = off) after the last one. [13] counts the touch boosts started.
+// 16 ms it sums the last `gpu-dcvs-span` windows and takes the frequency that would have kept that span 50 % busy (msm_gpu_devfreq's
+// upthreshold 50). A window's work is its busy time times the frequency it ran at, so the sum holds across a level change. The
+// governor goes up at once to the lowest level at or above 1.1 x of that frequency, to the top when the span was over 85 % busy or
+// after 50 ms busy without a break; it goes down one level after 4 windows in a row (5 right after a step up) that would have needed
+// at most 0.8 x the next lower level, and back to the floor after 80 ms without work. `gpu-dcvs-min` is the floor level (default 3,
+// 348 MHz). Each change is the same HFI GX_BW_PERF_VOTE as the boot vote, with that level's bandwidth. OPP MHz in sheng-gmu's table
+// order.
+// The span is 1 window by default: every window is judged by itself, and a load that starts in full reaches the top one window
+// later. A window is shorter than the gap between two jobs of a sparse load, so its busy share is the length of the one job in it:
+// at 680 MHz a job over 5.8 ms (36.2 % = 0.8 x 615 / (2 x 680)) clears the step-down count, and at 615 MHz a job over 7.3 ms
+// (45.5 % = 1 / (2 x 1.1)) asks for more than 615 MHz. A few such jobs a second hold the top two levels at 10 to 13 % busy.
+// `gpu-dcvs-span=3` judges about 50 ms instead, the interval msm_gpu_devfreq applies its threshold to. With a span above 1 the way
+// down uses the busiest span of the last 16 windows (260 ms): between two jobs the span is empty for 3 or 4 windows, enough for
+// the 4 windows of a step down, which the next job would undo. The span costs time on the frame (a job runs longer at the lower
+// level before its fence signals, and the top is reached after three windows instead of one), so it is an option.
+// native_gpu_dcvs_windows[4] is the measured length of the longest job, which decides whether the span rule applies to a load.
 constexpr uint32_t kGpuMHz[9] = {0, 220, 295, 348, 401, 475, 550, 615, 680};
 constexpr unsigned kGpuTop = 8;
+constexpr unsigned kGpuSpanMax = 8;   // `gpu-dcvs-span` at most
+constexpr unsigned kGpuKeep = 16;     // windows whose busiest span decides a step down
 extern "C" {
 // [0] 1 running, [1] level now, [2] changes, [3] failed votes, [4] busy % over the last 10 s, [5..12] % of those 10 s at levels 1..8,
 // [13] touch boosts, [14] wake boosts
 volatile uint32_t native_gpu_dcvs[15];
-// Every level change, the newest 256: [0] time (us since boot), [1] from << 56 | to << 48 | reason << 40 | window busy % << 32 | the MHz the window
+// Every level change, the newest 256: [0] time (us since boot), [1] from << 56 | to << 48 | reason << 40 | span busy % << 32 | the MHz the span
 // would have needed (32 bits). Reasons: 1 busy over 85 % or 50 ms without a break, 2 more frequency needed, 3 one step down, 4 idle for 80 ms,
 // 5 touch boost, 6 wake boost, 7 raised to the floor, 8 the vote failed.
 volatile uint64_t native_gpu_dcvs_log[256][2];
 volatile uint32_t native_gpu_dcvs_log_count;
+// Level changes since boot by the reason above ([1..8], [0] unused): which rule moves the level.
+volatile uint32_t native_gpu_dcvs_reasons[9];
+// The windows of the last 10 s: [0] how many, [1] with busy time, [2] of those under 1 % busy, [3] without busy time but with ring
+// words pending, [4] the longest busy time in one window (us), [5] the MHz it ran at; [6] rests since boot (80 ms without work),
+// [7] the span in windows. macOS runs 55 to 61 never counted a wake boost, also not after 10 s without a submission (run61, 181 to
+// 191 s), so some window in every 80 ms shows work there and the GPU never counts as rested; [1] to [3] tell which kind of work.
+volatile uint32_t native_gpu_dcvs_windows[8];
 extern volatile uint32_t native_hid_input_events[8] __attribute__((weak_import));
 }
 uint64_t gpuBusyTicks() {
@@ -1837,7 +1876,7 @@ void gpuPerfTick(uint64_t busyTicks) {
   }
  }
  uint32_t before[26]={},after[26]={};
- const bool preempt=bootArg("sheng-gpu-preempt",2)!=0;
+ const bool preempt=bootArg("gpu-preempt",2)!=0;
  const bool gotBefore=!preempt || (&native_adreno_preempt_stats && native_adreno_preempt_stats(before));
  uint64_t began=0;absolutetime_to_nanoseconds(mach_absolute_time(),&began);
  const auto values=counters.capture([](uint32_t reg){return gpuRd(reg);});
@@ -1859,7 +1898,7 @@ void gpuPerfTick(uint64_t busyTicks) {
 }
 void gpuDcvsThread(void *, wait_result_t) {
     ShengGmuIo &io = gColdDevice.io;
-    unsigned floor = bootArg("sheng-gpu-dcvs-min", 3);
+    unsigned floor = bootArg("gpu-dcvs-min", 3);
     if (floor < 1) floor = 1;
     if (floor > kGpuTop) floor = kGpuTop;
     io.write32(io.cookie, ShengGmuCore, kGmuReg(0x23b0e), 0xff000000u);
@@ -1873,12 +1912,21 @@ void gpuDcvsThread(void *, wait_result_t) {
     uint64_t lastBusy = gpuBusyTicks(), lastT = mach_absolute_time(), idleSince = lastT;
     uint64_t runNs = 0, winBusy = 0, winNs = 0, atLevel[kGpuTop + 1] = {};
     unsigned down = 0, hold = 0;
+    unsigned span = bootArg("gpu-dcvs-span", 1);
+    if (span < 1) span = 1;
+    if (span > kGpuSpanMax) span = kGpuSpanMax;
+    const unsigned keep = span > 1 ? kGpuKeep : 1;
+    native_gpu_dcvs_windows[7] = span;
+    // The last `span` windows (busy time, length, busy time x MHz), one bit per window that had work, and the last `keep` span needs.
+    uint64_t spanBusy[kGpuSpanMax] = {}, spanNs[kGpuSpanMax] = {}, spanWork[kGpuSpanMax] = {}, kept[kGpuKeep] = {};
+    unsigned spanAt = 0, keptAt = 0, spanActive = 0;
+    uint32_t seen = 0, seenBusy = 0, seenFaint = 0, seenRing = 0, longestUs = 0, longestMHz = 0;
     uint64_t boostAbs = 0, touchEnd = 0, wakeEnd = 0, wakeAbs = 0;
-    nanoseconds_to_absolutetime((uint64_t)bootArg("sheng-gpu-dcvs-boost-ms", 1000) * 1000000, &boostAbs);
+    nanoseconds_to_absolutetime((uint64_t)bootArg("gpu-dcvs-boost-ms", 1000) * 1000000, &boostAbs);
     nanoseconds_to_absolutetime(50000000ull, &wakeAbs);
     uint32_t touches = &native_hid_input_events ? native_hid_input_events[6] : 0;
     bool idle = false;
-    const bool tracePerf=bootArg("sheng-gpu-perf",0)==1;unsigned perfTick=0;
+    const bool tracePerf=bootArg("gpu-perf",0)==1;unsigned perfTick=0;
     for (;;) {
         IOSleep(16);
         const uint64_t busy = gpuBusyTicks(), t = mach_absolute_time();
@@ -1890,27 +1938,52 @@ void gpuDcvsThread(void *, wait_result_t) {
         lastBusy = busy; lastT = t;
         if (!ns) continue;
         winBusy += busyNs; winNs += ns; atLevel[cur] += ns;
-        const bool active = busyNs > 0 || gpuRd(A740_CP_RB_RPTR) != gpuRd(A740_CP_RB_WPTR);
-        const uint64_t need = busyNs * kGpuMHz[cur] * 2 / ns;
+        // Work in this window: 1 % of it busy or more, or jobs in the ring. A window with a trace of busy time and no job (every
+        // idle window has one: 298 of 298 in a 10 s idle stretch, 1 us each) is rest, or the GPU never rests, the wake boost never
+        // fires and the first job after a pause runs its first 16 ms at the floor.
+        const bool active = busyNs * 100 >= ns || gpuRd(A740_CP_RB_RPTR) != gpuRd(A740_CP_RB_WPTR);
+        ++seen;
+        if (busyNs) {
+            ++seenBusy;
+            if (busyNs * 100 < ns) ++seenFaint;
+            if (busyNs / 1000 > longestUs) {longestUs = (uint32_t)(busyNs / 1000); longestMHz = kGpuMHz[cur];}
+        } else if (active) {
+            ++seenRing;
+        }
+        spanBusy[spanAt] = busyNs; spanNs[spanAt] = ns; spanWork[spanAt] = busyNs * kGpuMHz[cur];
+        spanAt = (spanAt + 1) % span;
+        spanActive = (spanActive << 1 | (active ? 1u : 0u)) & ((1u << span) - 1);
+        uint64_t sumBusy = 0, sumNs = 0, sumWork = 0;
+        for (unsigned i = 0; i < span; ++i) {sumBusy += spanBusy[i]; sumNs += spanNs[i]; sumWork += spanWork[i];}
+        // The MHz that would have kept the span 50 % busy, and the highest such value of the last `keep` windows.
+        const uint64_t need = sumWork * 2 / sumNs;
+        kept[keptAt] = need;
+        keptAt = (keptAt + 1) % keep;
+        uint64_t peak = 0;
+        for (unsigned i = 0; i < keep; ++i) if (kept[i] > peak) peak = kept[i];
         runNs = busyNs * 100 >= ns * 95 ? runNs + ns : 0;
         unsigned want = cur, reason = 0;
-        if (busyNs * 100 > ns * 85 || runNs >= 50000000ull) {
+        bool rested = false;
+        if (sumBusy * 100 > sumNs * 85 || runNs >= 50000000ull) {
             want = kGpuTop;reason = 1;
         } else if (gpuLevelFor(need * 11 / 10) > cur) {
             want = gpuLevelFor(need * 11 / 10);reason = 2;
-        } else if (active) {
-            if (cur > floor && need * 10 <= (uint64_t)kGpuMHz[cur - 1] * 8) {
+        } else if (spanActive) {
+            if (cur > floor && peak * 10 <= (uint64_t)kGpuMHz[cur - 1] * 8) {
                 if (++down >= 4 + hold) {want = cur - 1;reason = 3;}
             } else {
                 down = 0;
             }
         } else {
-            uint64_t idle = 0;
-            absolutetime_to_nanoseconds(t - idleSince, &idle);
-            if (idle >= 80000000ull) {want = floor;reason = 4;}
+            uint64_t quiet = 0;
+            absolutetime_to_nanoseconds(t - idleSince, &quiet);
+            if (quiet >= 80000000ull) {want = floor;reason = 4;rested = true;}
         }
         if (active) idleSince = t;
-        if (!active && want == floor) idle = true;
+        // Idle only after those 80 ms: one empty window at the floor is the gap between two light frames, not a rest, and the wake boost
+        // after it took the level to the top about once a second with the GPU under 1 % busy (run54: 96 % of the time above the floor).
+        if (rested && !idle) native_gpu_dcvs_windows[6] = native_gpu_dcvs_windows[6] + 1;
+        if (rested) idle = true;
         if (active && idle) {
             idle = false; wakeEnd = t + wakeAbs; native_gpu_dcvs[14] = native_gpu_dcvs[14] + 1;
         }
@@ -1932,9 +2005,10 @@ void gpuDcvsThread(void *, wait_result_t) {
             absolutetime_to_nanoseconds(t, &tns);
             native_gpu_dcvs_log[slot][0] = tns / 1000;
             native_gpu_dcvs_log[slot][1] = (uint64_t)cur << 56 | (uint64_t)want << 48 | (uint64_t)(voted ? reason : 8) << 40 |
-                                           (uint64_t)(busyNs * 100 / ns) << 32 | (uint32_t)need;
-            boot_latency_record(4,cur,want,voted?reason:8,busyNs*100/ns,need,voted?want:cur);
+                                           (uint64_t)(sumBusy * 100 / sumNs) << 32 | (uint32_t)need;
+            boot_latency_record(4,cur,want,voted?reason:8,sumBusy*100/sumNs,need,voted?want:cur);
             native_gpu_dcvs_log_count = native_gpu_dcvs_log_count + 1;
+            native_gpu_dcvs_reasons[voted ? reason : 8] = native_gpu_dcvs_reasons[voted ? reason : 8] + 1;
             if (voted) {hold = want > cur; cur = want; native_gpu_dcvs[1] = cur; native_gpu_dcvs[2] = native_gpu_dcvs[2] + 1;}
             else native_gpu_dcvs[3] = native_gpu_dcvs[3] + 1;
             down = 0;
@@ -1943,6 +2017,9 @@ void gpuDcvsThread(void *, wait_result_t) {
             native_gpu_dcvs[4] = (uint32_t)(winBusy * 100 / winNs);
             for (unsigned l = 1; l <= kGpuTop; ++l) {native_gpu_dcvs[4 + l] = (uint32_t)(atLevel[l] * 100 / winNs); atLevel[l] = 0;}
             winBusy = winNs = 0;
+            native_gpu_dcvs_windows[0] = seen; native_gpu_dcvs_windows[1] = seenBusy; native_gpu_dcvs_windows[2] = seenFaint;
+            native_gpu_dcvs_windows[3] = seenRing; native_gpu_dcvs_windows[4] = longestUs; native_gpu_dcvs_windows[5] = longestMHz;
+            seen = seenBusy = seenFaint = seenRing = longestUs = longestMHz = 0;
         }
     }
 }
@@ -2030,11 +2107,11 @@ void gpuOn() {
     io.write32(io.cookie, ShengGmuCore, kG2hMask, ~(1u << 23));
     io.barrier(io.cookie);
     g[3] = rd(ShengGmuCore, kGxStatus);
-    // a6xx_gmu_set_initial_freq -> a6xx_hfi_set_freq: {ack_type 1 (blocking), freq index, bw index}. `sheng-gpu-perf=<n>` picks the
+    // a6xx_gmu_set_initial_freq -> a6xx_hfi_set_freq: {ack_type 1 (blocking), freq index, bw index}. `gpu-perf=<n>` picks the
     // GPU OPP (1 = 220 MHz ... 8 = 680 MHz, default 1) and the bandwidth level that OPP's opp-peak-kBps names; the bandwidth vote is
     // also the DDR floor while the GPU is on (no GPU DCVS changes either afterwards).
     unsigned perf = 1, bw = 1;
-    PE_parse_boot_argn("sheng-gpu-perf", &perf, sizeof(perf));
+    PE_parse_boot_argn("gpu-perf", &perf, sizeof(perf));
     perf = ShengGmuPerfVote ? ShengGmuPerfVote(perf, &bw) : 1;
     if (!ShengGmuPerfVote) bw = 1;
     native_gpu_perf_vote[0] = perf; native_gpu_perf_vote[1] = bw;
@@ -2261,8 +2338,8 @@ void gmuPrerequisites(const gpb_result &r) {
 void probeThread(void *, wait_result_t) {
     registerExecObserver();
     unsigned mode = 0;
-    PE_parse_boot_argn("sheng-gpu-power", &mode, sizeof mode);
-    {unsigned us = 0; if (PE_parse_boot_argn("sheng-gpu-pause-us", &us, sizeof us) && us >= 20 && us <= 100000) gPauseUs = us;}
+    PE_parse_boot_argn("gpu-power", &mode, sizeof mode);
+    {unsigned us = 0; if (PE_parse_boot_argn("gpu-pause-us", &us, sizeof us) && us >= 20 && us <= 100000) gPauseUs = us;}
     if (mode > 9) mode = 9;
     IOSleep(10000);
     native_gpu_power_stage = 1;
@@ -2291,7 +2368,7 @@ void probeThread(void *, wait_result_t) {
 
 extern "C" void sheng_gpu_power_probe(void) {
     unsigned mode = 0;
-    if (!PE_parse_boot_argn("sheng-gpu-power", &mode, sizeof mode) || !mode || native_gpu_power_stage) return;
+    if (!PE_parse_boot_argn("gpu-power", &mode, sizeof mode) || !mode || native_gpu_power_stage) return;
     native_gpu_power_stage = 1;
     thread_t thread = nullptr;
     if (kernel_thread_start(probeThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);

@@ -38,6 +38,9 @@ volatile uint32_t native_bluetooth_processes[4];
 /* log-bluetooth=2: printable runs in controller output, which carry its assert text. */
 char *volatile native_bluetooth_boot_text;
 volatile uint32_t native_bluetooth_boot_text_length;
+/* In-band sleep: wake indications sent, wake acknowledgements sent, sleep indications sent, clock stops undone by a wake
+ * inside the stop, writes an idle UART refused, interrupts of the shared line that found the wake disarmed, RX stop timeouts, wakes taken. */
+volatile uint64_t native_bluetooth_ibs[8];
 }
 namespace {
 struct Region {IOMemoryMap *map;volatile uint32_t *va;};
@@ -110,7 +113,11 @@ void pin(unsigned gpio,uint32_t cfg,int output=-1) {
 void rxIrq(void *) {
     volatile uint32_t *r=bt.tlmm.va+kRx*4096/4;
     if(!(r[3]&1))return;
+    /* Raw status stays on after the wake is disarmed, so every UART start bit latches it again, and each pin of the
+     * shared TLMM summary line calls this handler. Only the armed interrupt is a wake. */
+    if(!(r[2]&1)){native_bluetooth_ibs[5]=native_bluetooth_ibs[5]+1;return;}
     r[2]&=~1u;r[3]=0;barrier();
+    native_bluetooth_ibs[7]=native_bluetooth_ibs[7]+1;
     __atomic_store_n(&bt.rx_wake,1u,__ATOMIC_RELEASE);wake(nullptr);
 }
 void disarmRxWake(){bt.tlmm.va[(kRx*4096+8)/4]&=~1u;bt.tlmm.va[(kRx*4096+12)/4]=0;pin(kRx,3u|(1u<<2));}
@@ -165,8 +172,9 @@ void pump(void *) {
     }
     if(__atomic_exchange_n(&bt.rx_wake,0u,__ATOMIC_ACQ_REL) && bt.powered) {
         qbt_rx_wake(bt.core);
-        /* The GPIO consumed the first IBS wake byte while the UART was gated. */
-        const uint8_t wakeByte=0xfd;(void)qbt_receive(bt.core,&wakeByte,1);
+        /* The GPIO consumed the first IBS wake byte while the UART was gated. It counts as received, so a clock stop
+         * in progress (quiesce() pumps too) sees it and backs out. */
+        const uint8_t wakeByte=0xfd;bt.rx_sequence++;(void)qbt_receive(bt.core,&wakeByte,1);
     }
     if(!bt.gated) {
         if(qbt_geni_service(&bt.geni))wake(nullptr);
@@ -420,14 +428,14 @@ void powerResult(bool enabled,int error) {
     if(error && bt.geni.error)printf("[bluetooth uart] error=%d irq=%x/%x/%x/%x\n",bt.geni.error,bt.geni.fault_irq[0],bt.geni.fault_irq[1],bt.geni.fault_irq[2],bt.geni.fault_irq[3]);
 }
 void worker(void *,wait_result_t) {
-    thread_set_thread_name(current_thread(),"sheng-bluetooth");
+    thread_set_thread_name(current_thread(),"bluetooth");
     struct qbt_platform ops={nullptr,allocate,release,nowNs,writeUart,drained,setRate,flow,clockVote,pump,waitUntil,nativeRx,firmware,firmwarePut,log};
     bt.core=qbt_create(&ops);if(!bt.core){native_bluetooth_stats[0]=3;return;}
     struct qbt_transport_ops transport={nullptr,wake,requestPower};
     int e=qbt_transport_init(&transport);if(e){native_bluetooth_stats[0]=3;return;}
     while(native_gpu_addon_stage<1)waitUntil(nullptr,nowNs(nullptr)+10000000ULL);
     /* Wi-Fi settles WLAN_EN and the shared supplies first; its failure stage is negative. */
-    unsigned wifi=0;PE_parse_boot_argn("sheng-wifi",&wifi,sizeof(wifi));
+    unsigned wifi=0;PE_parse_boot_argn("wifi",&wifi,sizeof(wifi));
     if(wifi>=2) {
         uint64_t end=nowNs(nullptr)+15000000000ULL;
         while(nowNs(nullptr)<end) {
@@ -466,6 +474,9 @@ void worker(void *,wait_result_t) {
             native_bluetooth_stats[26]=stats.malformed;native_bluetooth_stats[27]=stats.unmatched_events;
             native_bluetooth_stats[28]=bt.geni.stats.rx_dma;native_bluetooth_stats[29]=bt.geni.stats.tx_dma;
             native_bluetooth_stats[15]=bt.geni.stats.line_errors;native_bluetooth_stats[16]=bt.geni.stats.dma_errors;
+            native_bluetooth_ibs[0]=stats.wake_ind;native_bluetooth_ibs[1]=stats.wake_ack;native_bluetooth_ibs[2]=stats.sleep_ind;
+            native_bluetooth_ibs[3]=stats.clock_reverts;native_bluetooth_ibs[4]=stats.tx_refused;
+            native_bluetooth_ibs[6]=bt.geni.stats.cancel_timeouts;
             health=t+1000000000ULL;
         }
         uint64_t deadline=bt.powered?qbt_deadline(bt.core):UINT64_MAX;
@@ -501,7 +512,7 @@ void processWatch(void *,wait_result_t) {
 }
 extern "C" void sheng_bluetooth_probe(void) {
     unsigned enabled=0;
-    if(!PE_parse_boot_argn("sheng-bluetooth",&enabled,sizeof(enabled)) || !enabled)return;
+    if(!PE_parse_boot_argn("bluetooth",&enabled,sizeof(enabled)) || !enabled)return;
     uint32_t expected=0;if(!__atomic_compare_exchange_n(&bt.started,&expected,1u,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return;
     native_bluetooth_stats[0]=1;
     if(!address()){native_bluetooth_stats[0]=3;native_bluetooth_stats[1]=(uint64_t)(int64_t)-ENOENT;return;}

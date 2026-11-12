@@ -16,9 +16,9 @@ static const char policy_head[] =
 static const char policy_watchdogd[]="<key>com.apple.watchdogd</key><true/>";
 // Bring-up isolation: hardware stacks show identityservicesd, contextstored and locationd in a
 // cycle of synchronous XPC waits. A disabled job makes its Mach service lookups fail instead of hang.
-// sheng-disable-jobs=<label>[,<label>...] (restricted label characters, bounded length).
+// disable-jobs=<label>[,<label>...] (restricted label characters, bounded length).
 static const char policy_tail[]="</dict></plist>\n";
-// sheng-lite=1: jobs that only reach for the network, iCloud or the photo library and have nothing to do on this tablet (no radios, no accounts),
+// lite=1: jobs that only reach for the network, iCloud or the photo library and have nothing to do on this tablet (no radios, no accounts),
 // all of which start at the first boot of a fresh Data and compete with SpringBoard for the CPU and for memory. The first three are the
 // cycle of synchronous XPC waits the isolation work found. Labels are the ones in the target's own LaunchDaemons.
 static const char lite_jobs[]=
@@ -38,14 +38,32 @@ static const char lite_jobs[]=
 // The board's always-on switches (pexpert/gen/bootargs.c reads them after the command line, which wins), so the boot loader's line,
 // at most 1000 bytes, carries only what changes between images: the staged system apps' view over /Applications (their icons), the
 // data-protection class kept on the unencrypted Data volume (PosterBoard's wallpaper store), and the camera daemon off (no camera:
-// it held a GPU client and wrote denied trace files every 5 s). The scheduler hygiene checks of a development kernel trace instead
-// of panicking, as a shipping (release) kernel has none: an interrupts-off window of 786 us in a work queue thread's priority change
-// panicked the board (untagged-203fd45bf).
-char PE_builtin_boot_args[]="owner-staged-apps=1 owner-dataprotect=1 sheng-disable-jobs=com.apple.cameracaptured sched_preemption_disable_debug_mode=1 interrupt-masked-debug-mode=1";
+// it held a GPU client and wrote denied trace files every 5 s).
+// The scheduler hygiene checks of a development kernel are off, as a shipping (release) kernel has none. Their default mode (2)
+// panics: an interrupts-off window of 786 us in a work queue thread's priority change panicked the board (untagged-203fd45bf).
+// Mode 1 (trace) reports only to kdebug and DTrace, which nothing on this board records, and keeps the whole measurement: every outermost
+// preemption disable masks interrupts and takes a three-frame backtrace and a timestamp, every matching enable another timestamp
+// (osfmk/arm/preemption_disable.c). The interrupt check of xnu-12377 takes a timestamp at every interrupt mask and unmask in any
+// mode, as long as its static key is on (osfmk/arm/machine_routines_common.c; xnu-10063 takes it only while a mode is on). So both
+// modes are 0 and validation_disables turns the two static keys off (0x10000 preemption, 0x40 interrupts; this takes a kernel whose
+// static keys read the built-in arguments, otherwise only the modes apply). Its bit 0x1000 stops the development kernel from
+// zero-filling every other page a process releases with madvise (madvise_free_debug_sometimes, osfmk/vm/vm_object.c), which a
+// release kernel never does. The checks that find kernel defects (assertions 0x800, mapping list 0x4, process reference tracking
+// 0x20000) stay on.
+// The command line wins: validation_disables=0 sched_preemption_disable_debug_mode=1 interrupt-masked-debug-mode=1 traces again.
+// macOS 27.3 also takes here the switches only its kernel reads, which do not fit the command line any more: userspace reads the
+// scaled timebase itself, signatures are authenticated per block at first use, the cover touchpad takes a lone contact, the
+// scheduler's two-cluster matrix, the boot payload's memory returned, the thermal probe (sampled every 100 ms) and the level macOS
+// reads from it, and the board clock. The Metal plugin reads its own switches from kern.bootargs, so they stay on the command line.
+char PE_builtin_boot_args[]="owner-staged-apps=1 owner-dataprotect=1 disable-jobs=com.apple.cameracaptured sched_preemption_disable_debug_mode=0 interrupt-masked-debug-mode=0 validation_disables=0x11040"
+#if XNU_TARGET_OS_OSX
+    " timebase-user=1 cs-lazy=1 keyboard-lone=1 armcpu-edge=1 boot-payload-release=1 thermal=1 thermal-ms=100 thermal-level=1 board-clock=7 gpu-pool=0"
+#endif
+    ;
 static char policy[2048],jobs[200];
 volatile int sheng_watchdog_policy_status=-1;
 
-// sheng-setup=1 or sheng-data-reset=2 (the install entry's "show Hello" choice): remove Setup's completion flags once, so this boot shows the Hello page.
+// setup=1 or data-reset=2 (the install entry's "show Hello" choice): remove Setup's completion flags once, so this boot shows the Hello page.
 // iPadOS writes them again when Setup finishes, so later boots do not show it. Absent files are fine.
 static int sheng_boot_setup_reset(proc_t p,uint64_t scratch) {
  static const char *const files[]={
@@ -77,14 +95,14 @@ static int append_job(const char **cursor) {
 int sheng_boot_watchdog_policy(void *process, uint64_t scratch) {
  proc_t p=process;
  int enabled=0,error=0,fd=-1;int32_t result=0;
- PE_parse_boot_argn("sheng-disable-watchdogd",&enabled,sizeof(enabled));
- if(!PE_parse_boot_argn("sheng-disable-jobs",jobs,sizeof(jobs)))jobs[0]=0;jobs[sizeof(jobs)-1]=0;
- int lite=0;PE_parse_boot_argn("sheng-lite",&lite,sizeof(lite));if(lite!=1 && lite!=2)lite=0;
+ PE_parse_boot_argn("disable-watchdogd",&enabled,sizeof(enabled));
+ if(!PE_parse_boot_argn("disable-jobs",jobs,sizeof(jobs)))jobs[0]=0;jobs[sizeof(jobs)-1]=0;
+ int lite=0;PE_parse_boot_argn("lite",&lite,sizeof(lite));if(lite!=1 && lite!=2)lite=0;
  if(enabled!=1)enabled=0;
  for(const char *c=jobs;*c;++c)if(!((*c>='a'&&*c<='z')||(*c>='A'&&*c<='Z')||(*c>='0'&&*c<='9')||*c=='.'||*c=='-'||*c==','))return EINVAL;
  int setup=0,reset=0;
- PE_parse_boot_argn("sheng-setup",&setup,sizeof(setup));
- PE_parse_boot_argn("sheng-data-reset",&reset,sizeof(reset));   // 2 = erase Data and show the Hello page; 1 = erase Data, Setup stays skipped
+ PE_parse_boot_argn("setup",&setup,sizeof(setup));
+ PE_parse_boot_argn("data-reset",&reset,sizeof(reset));   // 2 = erase Data and show the Hello page; 1 = erase Data, Setup stays skipped
  if(reset==2)setup=1;
  if(setup==1 && (error=sheng_boot_setup_reset(p,scratch))) {
   sheng_watchdog_policy_status=error;
