@@ -159,7 +159,11 @@ jobs:
                  " f'code end {code_end:#x}, __DATA {self.roots[\"__DATA\"][\"va\"]:#x}, '"
                  " f'over by {code_end - self.roots[\"__DATA\"][\"va\"]} bytes')")
           if old in s:
-              p.write_text(s.replace(old, new))
+              s = s.replace(old, new)
+          old = "raise ValueError(f'Native {segment[\"name\"]} overlaps a retained segment')"
+          new = ("raise ValueError(f'Native {segment[\"name\"]} overlaps a retained segment: {begin:#x}..{end:#x} meets '"
+                 " + ', '.join(f'{b:#x}..{e:#x}' for b, e in self.occupied + placed if begin < e and b < end))")
+          p.write_text(s.replace(old, new))
           PY
       - name: package
         working-directory: device
@@ -174,6 +178,34 @@ jobs:
             args+=(--init-data)
           fi
           scripts/package.sh "${args[@]}"
+      - name: native kernel data report
+        # Diagnostic only, after a failed package: the native kernel's __DATA sections and its largest __DATA symbols.
+        if: failure()
+        run: |
+          python3 - <<'PY'
+          import glob, re, subprocess
+          kernels = glob.glob('UniXNU/out/sheng/*/*/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf')
+          if not kernels:
+              raise SystemExit('no native kernel')
+          kernel = kernels[0]
+          out = subprocess.run(['otool', '-l', kernel], capture_output=True, text=True).stdout
+          for block in re.split(r'Load command|\nSection\n', out)[1:]:
+              fields = dict(re.findall(r'^\s*(\w+) (\S+)$', block, re.M))
+              if fields.get('segname') == '__DATA':
+                  print(fields.get('sectname', 'segment'), fields.get('addr', fields.get('vmaddr')), fields.get('size', fields.get('vmsize')))
+          lines = subprocess.run(['nm', '-n', '-m', kernel], capture_output=True, text=True).stdout.splitlines()
+          symbols = []
+          for line in lines:
+              m = re.match(r'^([0-9a-f]{16}) \((__\w+),(__\w+)\) .*? (\S+)$', line)
+              if m:
+                  symbols.append((int(m.group(1), 16), m.group(2), m.group(3), m.group(4)))
+          sized = []
+          for (a, seg, sect, name), nxt in zip(symbols, symbols[1:] + [(None,) * 4]):
+              if seg == '__DATA' and nxt[0] is not None and nxt[1] == '__DATA' and nxt[2] == sect:
+                  sized.append((nxt[0] - a, sect, name))
+          for size, sect, name in sorted(sized, reverse=True)[:120]:
+              print(size, sect, name)
+          PY
       - uses: actions/cache/save@v4
         if: always() && inputs.os == '27' && steps.data-cache.outputs.cache-hit != 'true' && hashFiles('UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr') != ''
         with:
