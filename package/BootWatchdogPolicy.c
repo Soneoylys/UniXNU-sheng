@@ -9,6 +9,13 @@
 #include <sys/stat.h>
 #include <pexpert/pexpert.h>
 
+extern void boot_log_startup_result(const char *, int) __attribute__((weak_import));
+static int policy_step(const char *stage, int result) {
+ if (&boot_log_startup_result) boot_log_startup_result(stage, result);
+ return result;
+}
+#define POLICY_CALL(stage, expression) (policy_step(stage " enter", 0), policy_step(stage " returned", (expression)))
+
 static const char policy_head[] =
  "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
  "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
@@ -55,12 +62,12 @@ static const char lite_jobs[]=
 // scaled timebase itself, signatures are authenticated per block at first use, the cover touchpad takes a lone contact, the
 // scheduler's two-cluster matrix, the boot payload's memory returned, the thermal probe (sampled every 100 ms) and the level macOS
 // reads from it, and the board clock. The Metal plugin reads its own switches from kern.bootargs, so they stay on the command line.
-char PE_builtin_boot_args[]="owner-staged-apps=1 owner-dataprotect=1 disable-jobs=com.apple.cameracaptured sched_preemption_disable_debug_mode=0 interrupt-masked-debug-mode=0 validation_disables=0x11040"
+char PE_builtin_boot_args[]="owner-staged-apps=1 owner-dataprotect=1 uefi-watchdog=1 disable-jobs=com.apple.cameracaptured sched_preemption_disable_debug_mode=0 interrupt-masked-debug-mode=0 validation_disables=0x11040"
 #if XNU_TARGET_OS_OSX
     " timebase-user=1 cs-lazy=1 keyboard-lone=1 armcpu-edge=1 boot-payload-release=1 thermal=1 thermal-ms=100 thermal-level=1 board-clock=7 gpu-pool=0"
 #endif
     ;
-static char policy[2048],jobs[200];
+static char policy[2048],jobs[200],enable_jobs[200];
 volatile int sheng_watchdog_policy_status=-1;
 
 // setup=1 or data-reset=2 (the install entry's "show Hello" choice): remove Setup's completion flags once, so this boot shows the Hello page.
@@ -80,25 +87,29 @@ static int sheng_boot_setup_reset(proc_t p,uint64_t scratch) {
  return 0;
 }
 
-// One comma-separated label at *c into the policy as a disabled key; advances *c past it.
-static int append_job(const char **cursor) {
+// Append one label with its launchd disabled state and advance past the comma.
+static int append_job_state(const char **cursor,int disabled) {
  const char *c=*cursor,*e=c;while(*e && *e!=',')++e;
  if(e>c) {
   if(strlcat(policy,"<key>",sizeof(policy))>=sizeof(policy))return EINVAL;
   size_t at=strlen(policy);if(at+(size_t)(e-c)+1>=sizeof(policy))return EINVAL;
   memcpy(policy+at,c,(size_t)(e-c));policy[at+(size_t)(e-c)]=0;
-  if(strlcat(policy,"</key><true/>",sizeof(policy))>=sizeof(policy))return EINVAL;
+  if(strlcat(policy,disabled?"</key><true/>":"</key><false/>",sizeof(policy))>=sizeof(policy))return EINVAL;
  }
  *cursor=*e?e+1:e;return 0;
 }
+
+static int append_job(const char **cursor) {return append_job_state(cursor,1);}
 
 int sheng_boot_watchdog_policy(void *process, uint64_t scratch) {
  proc_t p=process;
  int enabled=0,error=0,fd=-1;int32_t result=0;
  PE_parse_boot_argn("disable-watchdogd",&enabled,sizeof(enabled));
  if(!PE_parse_boot_argn("disable-jobs",jobs,sizeof(jobs)))jobs[0]=0;jobs[sizeof(jobs)-1]=0;
+ if(!PE_parse_boot_argn("enable-jobs",enable_jobs,sizeof(enable_jobs)))enable_jobs[0]=0;enable_jobs[sizeof(enable_jobs)-1]=0;
  int lite=0;PE_parse_boot_argn("lite",&lite,sizeof(lite));if(lite!=1 && lite!=2)lite=0;
  if(enabled!=1)enabled=0;
+ for(const char *c=enable_jobs;*c;++c)if(!((*c>='a'&&*c<='z')||(*c>='A'&&*c<='Z')||(*c>='0'&&*c<='9')||*c=='.'||*c=='-'||*c==','))return EINVAL;
  for(const char *c=jobs;*c;++c)if(!((*c>='a'&&*c<='z')||(*c>='A'&&*c<='Z')||(*c>='0'&&*c<='9')||*c=='.'||*c=='-'||*c==','))return EINVAL;
  int setup=0,reset=0;
  PE_parse_boot_argn("setup",&setup,sizeof(setup));
@@ -110,7 +121,7 @@ int sheng_boot_watchdog_policy(void *process, uint64_t scratch) {
   return error;
  }
  if(setup==1)printf("sheng setup flags reset: Hello page on this boot\n");
- if(!enabled && !jobs[0] && !lite)return 0;
+ if(!enabled && !jobs[0] && !enable_jobs[0] && !lite)return 0;
  policy[0]=0;strlcat(policy,policy_head,sizeof(policy));
  if(enabled)strlcat(policy,policy_watchdogd,sizeof(policy));
  if(lite)for(const char *c=lite_jobs;*c;) {if((error=append_job(&c)))return error;}
@@ -119,18 +130,19 @@ int sheng_boot_watchdog_policy(void *process, uint64_t scratch) {
   if((error=append_job(&icon_agent)))return error;
  }
  for(const char *c=jobs;*c;) {if((error=append_job(&c)))return error;}
+ for(const char *c=enable_jobs;*c;) {if((error=append_job_state(&c,0)))return error;}
  strlcat(policy,policy_tail,sizeof(policy));
  const char *directory="/private/var/db/com.apple.xpc.launchd";
  const char *path="/private/var/db/com.apple.xpc.launchd/disabled.plist";
  if((error=copyout(directory,scratch,strlen(directory)+1)))goto done;
  struct mkdir_args md={.path=scratch,.mode=0755};
- error=mkdir(p,&md,&result);
+ error=POLICY_CALL("launch policy mkdir", mkdir(p,&md,&result));
  if(error && error!=EEXIST)goto done;
  if((error=copyout(path,scratch,strlen(path)+1)))goto done;
  // With persistent Data the previous boot's file is there: this policy is rewritten in place on every boot (it must follow the
  // boot arguments). Symlinks are still refused (O_NOFOLLOW) and the fstat check below insists on a root-owned regular file.
  struct open_args op={.path=scratch,.flags=O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW,.mode=0644};
- if((error=open(p,&op,&result)))goto done;
+ if((error=POLICY_CALL("launch policy open", open(p,&op,&result))))goto done;
  fd=result;
  // The scratch page keeps the cache-mount environment slots at +0x400, so the policy (the lite list makes it longer than 0x200 bytes) goes
  // out in pieces through the 0x200 bytes at +0x200.
@@ -139,30 +151,30 @@ int sheng_boot_watchdog_policy(void *process, uint64_t scratch) {
   if((error=copyout(policy+sent,scratch+0x200,piece)))goto done;
   struct write_args wr={.fd=fd,.cbuf=scratch+0x200,.nbyte=piece};
   user_ssize_t written=0;
-  if((error=write(p,&wr,&written)))goto done;
+  if((error=POLICY_CALL("launch policy write", write(p,&wr,&written))))goto done;
   if(written!=(user_ssize_t)piece){error=EIO;goto done;}
   sent+=piece;
  }
  struct fchown_args owner={.fd=fd,.uid=0,.gid=0};
- if((error=fchown(p,&owner,&result)))goto done;
+ if((error=POLICY_CALL("launch policy chown", fchown(p,&owner,&result))))goto done;
  struct fchmod_args mode={.fd=fd,.mode=0644};
- if((error=fchmod(p,&mode,&result)))goto done;
+ if((error=POLICY_CALL("launch policy chmod", fchmod(p,&mode,&result))))goto done;
  struct fsync_args sync={.fd=fd};
- if((error=fsync(p,&sync,&result)))goto done;
+ if((error=POLICY_CALL("launch policy fsync", fsync(p,&sync,&result))))goto done;
  // Preserve the cache-mount environment slots at +0x400, +0x500, +0x600.
  struct fstat64_args sa={.fd=fd,.ub=scratch+0x800};struct stat64 st={0};
- if((error=sys_fstat64(p,&sa,&result)) || (error=copyin(sa.ub,&st,sizeof(st))))goto done;
+ if((error=POLICY_CALL("launch policy stat", sys_fstat64(p,&sa,&result))) || (error=copyin(sa.ub,&st,sizeof(st))))goto done;
  if(st.st_uid!=0 || st.st_gid!=0 || !S_ISREG(st.st_mode) || (st.st_mode&0777)!=0644 || st.st_size!=(off_t)(strlen(policy)))error=EINVAL;
  done:
- if(fd>=0){struct close_args cl={.fd=fd};int e=sys_close(p,&cl,&result);if(!error)error=e;}
+ if(fd>=0){struct close_args cl={.fd=fd};int e=POLICY_CALL("launch policy close", sys_close(p,&cl,&result));if(!error)error=e;}
  // A real empty migration marker selects the qualified modern override loader.
  if(!error) {
   const char *marker="/private/var/db/com.apple.xpc.launchd/disabled.migrated";
   error=copyout(marker,scratch,strlen(marker)+1);
   if(!error) {
    struct open_args mark={.path=scratch,.flags=O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,.mode=0644};
-   error=open(p,&mark,&result);
-   if(!error){struct close_args cl={.fd=result};error=sys_close(p,&cl,&result);}
+   error=POLICY_CALL("launch policy marker open", open(p,&mark,&result));
+   if(!error){struct close_args cl={.fd=result};error=POLICY_CALL("launch policy close", sys_close(p,&cl,&result));}
    else if(error==EEXIST)error=0;
   }
  }
