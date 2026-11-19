@@ -172,6 +172,25 @@ jobs:
                  " + ', '.join(f'{b:#x}..{e:#x}' for b, e in self.occupied + placed if begin < e and b < end))")
           p.write_text(s.replace(old, new))
           PY
+      - name: Metal bridge on iPadOS
+        # metal2vulkan 46e7cc96 (UniXNU main's translator pin) defines read_pages for Linux, macOS and Windows only, so the
+        # iPadOS bridge (aarch64-apple-ios) stopped with E0425 in copied.rs. ci/metal2vulkan/0065-read-pages-on-ios.patch gives
+        # iOS the macOS variant (mach_vm_read_overwrite), applied after the recorded patches. Nothing happens once UniXNU's list changes.
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          script = pathlib.Path('UniXNU/scripts/build-adreno-metal-bridge.py')
+          s = script.read_text()
+          old = "    '0064-copies-leave-unreachable-pages-alone.patch']]\n"
+          patch = (pathlib.Path('device/ci/metal2vulkan/0065-read-pages-on-ios.patch')).resolve()
+          if patch.name in s:
+              print('translator patches: already added')
+          elif old in s:
+              script.write_text(s.replace(old, old + f"PATCHES.append(Path({str(patch)!r}))\n", 1))
+              print('translator patches: added', patch)
+          else:
+              print('UniXNU translator patch list changed; no extra patch')
+          PY
       - name: package
         working-directory: device
         env:
