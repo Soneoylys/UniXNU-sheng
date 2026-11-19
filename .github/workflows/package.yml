@@ -43,7 +43,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: UniXNU/UniXNU
-          ref: 14236be44fd56fb94d11594864ffb70780352150 # UniXNU main; it carries the Turnip patch new file mode fix and every submodule at its newest main or a commit with the same tree
+          ref: 8542980d02b4d2cc5c32ee3542de1760b2562aac # UniXNU main on 2026-11-19; every submodule is at its newest main or a commit with the same code
           path: UniXNU
           submodules: recursive
       - uses: actions/checkout@v4
