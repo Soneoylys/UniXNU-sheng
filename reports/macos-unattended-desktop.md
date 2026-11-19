@@ -17,6 +17,8 @@ python3 scripts/prepare-sheng-gpu-lab.py INPUT.img OUTPUT.img \
 
 The image includes the selected GPU addon, automatic login, graphics logs and SSH key. Its file mode is `0600`. The login job selects the account, keeps the screen and system awake and sets both sleep timers to zero. Shader Cache provides manual Start and Stop controls.
 
+For a persistent desktop, use `autoreset=0` and `uefi-watchdog=1`. Firmware hands over an armed 30-second Gunyah watchdog; the kernel takes ownership and feeds it indefinitely when the return deadline is zero. Diagnostic recording uses the separate `log` and `diag` settings.
+
 ## Run and collect
 
 ```sh
@@ -49,6 +51,8 @@ python3 scripts/prepare-sheng-gpu-lab.py INPUT.img OUTPUT.img \
 ```
 
 This capture requests the Settings sidebar icons through IconServices with cache bypass, exports `icons.png` and records the selected command buffer. Compare backgrounds, glyphs and edges against the [rendering reference](metal-upstream-rendering.md). `graphics-state.log` includes process and SSH state; `graphics-events-previous.log` contains the isolated command-buffer payloads.
+
+Render-server stderr is appended to `/private/var/tmp/NativeAdrenoMetal.cache/runtime-stderr.log`. Each process records its boot UUID and PID. Graphics diagnostics include the current boot's last 64 KiB in `graphics-state.log`. Capture `s3a6e1-222ad7510d` exported the boot marker for WindowServer PID 171, completed the ordered desktop workload and returned to fastboot.
 
 Capture `sa5ae6-42021120d`, boot `50C2AB62-9A9F-40B9-9099-5B9C12872385`, used the one-pass account preparation and reached General Settings. All 56-source atlas pixels and selected attachment statistics matched the main reference. Console user `unixnu` (UID 501), caffeinate, enabled SSH and Shader Cache `running=false` were recorded. The image returned after 206.224 seconds; Linux retrieval took 18.856 seconds and fastboot responded. Complete macOS CI: [43992174081](https://github.com/UniXNU/UniXNU-sheng/actions/runs/43992174081).
 
