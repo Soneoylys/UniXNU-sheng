@@ -136,6 +136,13 @@ jobs:
                               '--sparse', source['url'], directory], check=True)
               subprocess.run(['git', '-C', directory, 'sparse-checkout', 'set', '--no-cone', '/.unixnu-placeholder'],
                              check=True)
+              # A release branch (FreeBSD releng/15.1) moves past the locked commit; check that commit out by SHA.
+              head = subprocess.run(['git', '-C', directory, 'rev-parse', 'HEAD'], check=True, capture_output=True,
+                                    text=True).stdout.strip()
+              if head != source['commit']:
+                  subprocess.run(['git', '-C', directory, 'fetch', '--depth', '1', '--filter=blob:none', 'origin',
+                                  source['commit']], check=True)
+                  subprocess.run(['git', '-C', directory, 'checkout', '--detach', source['commit']], check=True)
           PY
           python3 tools/fetch-sources.py
       - name: keyboard and video firmware
