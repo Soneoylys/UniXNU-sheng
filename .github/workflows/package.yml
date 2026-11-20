@@ -232,6 +232,33 @@ jobs:
           for size, sect, name in sorted(sized, reverse=True)[:120]:
               print(size, sect, name)
           PY
+      - name: prelink stub report
+        # Diagnostic only, after a failed package: for each stubbed or missing original function of the prelink record, the paired
+        # original functions around it with their native names, so the function that lost its pairing can be named.
+        if: failure()
+        run: |
+          python3 - <<'PY'
+          import bisect, glob, json
+          records = glob.glob('UniXNU/out/sheng/*/*/kernel/kernel.failed.json') + glob.glob('UniXNU/out/sheng/*/*/kernel/kernel.json')
+          maps = glob.glob('UniXNU/out/sheng/*/*/kernel/kernel.map.json')
+          if not records or not maps:
+              raise SystemExit(f'no prelink record or map: {records} {maps}')
+          record = json.load(open(records[0]))
+          pairing = json.load(open(maps[0]))
+          slide = int(record['collection_slide'], 16)
+          functions = {int(k, 16): v for k, v in pairing['functions'].items()}
+          keys = sorted(functions)
+          print('record', records[0], 'map', maps[0], 'slide', hex(slide), 'paired', len(keys))
+          for kind in ('missing', 'stubbed'):
+              for owner, targets in sorted(record[kind].items()):
+                  for target, count in sorted(targets.items()):
+                      original = (int(target, 16) - slide) & ((1 << 64) - 1)
+                      print(f'== {kind} {owner} original {original:#x} ({count} sites)')
+                      i = bisect.bisect_left(keys, original)
+                      for k in keys[max(0, i - 6):i + 6]:
+                          v = functions[k]
+                          print(f'   {k:#x} {k - original:+#x} {v["how"]:<18} {v["native"]} {v["name"]}+{v["addend"]}')
+          PY
       - uses: actions/cache/save@v4
         if: always() && inputs.os == '27' && steps.data-cache.outputs.cache-hit != 'true' && hashFiles('UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr') != ''
         with:
