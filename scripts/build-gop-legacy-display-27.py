@@ -284,9 +284,10 @@ r = json.loads((ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELO
 source = ROOT / 'kits/sheng/LegacyDisplayProbe.cpp'
 
 
-# The kernel's recipes compile with -O2. On iPadOS the board objects take -Os: the native text of the 24A446 collection runs into its
-# __DATA otherwise (package run #12 was 32 KiB over with the WiFi stack already at -Os). macOS keeps the kernel's flags.
-BOARD_OPTIMIZE = () if MACOS else ('-Os',)
+# The kernel's recipes compile with -O2. On iPadOS the board objects take -Oz: the native text of the 24A446 collection runs into its
+# __DATA otherwise (package run #12 was 32 KiB over with the WiFi stack already at -Os; run 44647581692 was 16 KiB over with the
+# board objects at -Os). macOS keeps the kernel's flags.
+BOARD_OPTIMIZE = () if MACOS else ('-Oz',)
 
 
 def compile_cpp(src, dst, extra=()):
