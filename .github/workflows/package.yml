@@ -259,6 +259,34 @@ jobs:
                           v = functions[k]
                           print(f'   {k:#x} {k - original:+#x} {v["how"]:<18} {v["native"]} {v["name"]}+{v["addend"]}')
           PY
+      - name: collect prelink inputs
+        # Diagnostic only, after a failed package: the native and comparison kernels, the kernelcache and the pairing map, for
+        # matching prelink failures offline. The platform seed only enters the payload, after prelink; a file holding it is left out.
+        if: failure()
+        env:
+          SEED: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+        run: |
+          mkdir -p prelink-inputs
+          for f in UniXNU/out/sheng/*/*/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf \
+                   UniXNU/out/sheng/*/*/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.noctf \
+                   UniXNU/out/ipsw/*/kernelcache.decompressed \
+                   UniXNU/out/sheng/*/*/kernel/kernel.map.json UniXNU/out/sheng/*/*/kernel/kernel.failed.json; do
+            [ -f "$f" ] || continue
+            if [ -n "$SEED" ] && grep -qiF "$SEED" "$f"; then
+              echo "left out (holds the seed): $f"
+              continue
+            fi
+            cp "$f" prelink-inputs/
+          done
+          ls -l prelink-inputs
+      - name: prelink inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prelink-inputs-${{ inputs.os }}
+          retention-days: 1
+          if-no-files-found: ignore
+          path: prelink-inputs
       - uses: actions/cache/save@v4
         if: always() && inputs.os == '27' && steps.data-cache.outputs.cache-hit != 'true' && hashFiles('UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr') != ''
         with:
