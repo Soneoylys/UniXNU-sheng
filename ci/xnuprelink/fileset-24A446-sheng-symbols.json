@@ -1,0 +1,17 @@
+{
+ "inputs": {
+  "kernelcache_sha256": "38e6d9fa5f789b8228f4617ef4c6d2a3fd8ab564abdc9b62920f1db53fc1780a",
+  "entry": "com.apple.kernel"
+ },
+ "description": "Sheng board identities for the 24A446 kernel that order and shape matching stopped pairing. The workflow copies this file into kits/XnuPrelink/fixtures before the package step.",
+ "functions": [
+  {
+   "original": "0xfffffe000aec5fac",
+   "original_size": 52,
+   "original_sha256": "392c95f5d1bfc12d57b6fbd680d3630e803ff30d70dcc69e9ea12f0be46fb53b",
+   "native_symbol": "_ml_at_interrupt_context",
+   "evidence": "Reads DAIF and returns 0 when IRQ, FIQ or SError is unmasked; otherwise loads thread->machine.CpuDatap from tpidr_el1 (+0x1b8), then cpu_int_state (+0xd0), and returns whether it is non-NULL. Source: osfmk/arm/machine_routines_common.c ml_at_interrupt_context. The release reference _ml_at_interrupt_context has the same 13 instructions except the CpuDatap offset (+0x1b0). It sits between sched_perfcontrol_ml_set_interrupts_without_measurement and ml_stack_remaining in both images. Callers: AppleUSBXHCI and IOPCIFamily (package run 44664988530)."
+  }
+ ],
+ "data": []
+}

@@ -191,6 +191,11 @@ jobs:
           else:
               print('UniXNU translator patch list changed; no extra patch')
           PY
+      - name: prelink reviewed identities
+        # XnuPrelink loads every fixtures/fileset-*-symbols.json pinned to the kernelcache. The sheng file names
+        # ml_at_interrupt_context (24A446 0xfffffe000aec5fac, called by AppleUSBXHCI and IOPCIFamily), which reference order
+        # stopped pairing: its gap has unequal counts and the function makes no calls (package run 44664988530).
+        run: cp device/ci/xnuprelink/fileset-24A446-sheng-symbols.json UniXNU/kits/XnuPrelink/fixtures/
       - name: package
         working-directory: device
         env:
